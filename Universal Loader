@@ -638,15 +638,34 @@ local function destroyExistingOverlay(parent)
     end)
 end
 
-local function getOverlayContainers()
-    local coreGui = safeGetService("CoreGui")
+local function getHiddenUiContainer()
     local gethuiFn = pickFirstFunction(gethui, env.gethui)
+    if not gethuiFn then
+        return nil
+    end
+    local okHui, resHui = pcall(gethuiFn)
+    if okHui and resHui then
+        return resHui
+    end
+    return nil
+end
+
+local function getRawCoreGui()
+    if not game or type(game.GetService) ~= "function" then
+        return nil
+    end
+    local ok, cg = pcall(game.GetService, game, "CoreGui")
+    if ok and cg then
+        return cg
+    end
+    return nil
+end
+
+local function getOverlayContainers(allowHui)
+    local coreGui = safeGetService("CoreGui") or getRawCoreGui()
     local hiddenUi = nil
-    if gethuiFn then
-        local okHui, resHui = pcall(gethuiFn)
-        if okHui and resHui then
-            hiddenUi = resHui
-        end
+    if allowHui then
+        hiddenUi = getHiddenUiContainer()
     end
     local playerGui = nil
     if LocalPlayer then
@@ -685,11 +704,12 @@ local function createDarkOverlay(keyObj)
         return nil
     end
 
-    local coreGui, hiddenUi, playerGui = getOverlayContainers()
+    local allowHui = (env.__UniversalLoaderUsedHui == true)
+    local coreGui, hiddenUi, playerGui = getOverlayContainers(allowHui)
+    local rawCoreGui = getRawCoreGui()
     clearAllOverlays(coreGui, hiddenUi, playerGui)
-
-    if not coreGui and not hiddenUi and not playerGui then
-        return nil
+    if rawCoreGui and rawCoreGui ~= coreGui then
+        destroyExistingOverlay(rawCoreGui)
     end
 
     local gui = nil
@@ -760,8 +780,21 @@ local function createDarkOverlay(keyObj)
     end
 
     local attached = attachOverlayParent(gui, coreGui, -10)
-        or attachOverlayParent(gui, hiddenUi, -10)
+        or (rawCoreGui and rawCoreGui ~= coreGui and attachOverlayParent(gui, rawCoreGui, -10))
         or attachOverlayParent(gui, playerGui, 2147483647)
+
+    if not attached then
+        hiddenUi = hiddenUi or getHiddenUiContainer()
+        if hiddenUi then
+            destroyExistingOverlay(hiddenUi)
+            attached = attachOverlayParent(gui, hiddenUi, -10)
+            if attached then
+                pcall(function()
+                    env.__UniversalLoaderUsedHui = true
+                end)
+            end
+        end
+    end
 
     if not attached then
         pcall(function()
@@ -779,7 +812,8 @@ local function syncAfkDarkOverlay(enabled)
                 state.afkOverlay.Enabled = false
             end)
         elseif cfg.AFKDarkScreen then
-            local coreGui, hiddenUi, playerGui = getOverlayContainers()
+            local allowHui = (env.__UniversalLoaderUsedHui == true)
+            local coreGui, hiddenUi, playerGui = getOverlayContainers(allowHui)
             clearAllOverlays(coreGui, hiddenUi, playerGui)
         end
         return

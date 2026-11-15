@@ -21,23 +21,11 @@ do
         end)
     end
 
-    local function safeCloneRef(instance)
-        if instance and type(cloneref) == "function" then
-            local ok, cloned = pcall(cloneref, instance)
-            if ok and cloned then
-                return cloned
-            end
-        end
-        return instance
-    end
-
     local function safeGetService(serviceName)
         if not game or type(game.GetService) ~= "function" then
             return nil
         end
-        local ok, service = pcall(function()
-            return safeCloneRef(game:GetService(serviceName))
-        end)
+        local ok, service = pcall(game.GetService, game, serviceName)
         if ok then
             return service
         end
@@ -84,11 +72,17 @@ do
         if not signal then
             return nil
         end
-        local fn = signal.Connect or signal.connect
-        if type(fn) ~= "function" then
+        local ok, conn = pcall(function()
+            return signal:Connect(callback)
+        end)
+        if not ok then
+            ok, conn = pcall(function()
+                return signal:connect(callback)
+            end)
+        end
+        if not ok then
             return nil
         end
-        local conn = fn(signal, callback)
         if not untracked then
             trackConnection(conn)
         end
@@ -126,13 +120,8 @@ do
     end
 
     local function attachRootGui(gui)
-        if type(gethui) == "function" then
-            local ok, hui = pcall(gethui)
-            if ok and tryParentGui(gui, hui) then
-                return true
-            end
-        end
-        if tryParentGui(gui, CoreGui) then
+        local coreGuiContainer = CoreGui or safeGetService("CoreGui")
+        if tryParentGui(gui, coreGuiContainer) then
             return true
         end
         local localPlayer = Players and Players.LocalPlayer
@@ -148,6 +137,12 @@ do
                 if ok and tryParentGui(gui, pg) then
                     return true
                 end
+            end
+        end
+        if type(gethui) == "function" then
+            local ok, hui = pcall(gethui)
+            if ok and tryParentGui(gui, hui) then
+                return true
             end
         end
         return false
@@ -269,7 +264,9 @@ do
                 if isObjectAlive(obj) then
                     writeIdx = writeIdx + 1
                     library.rainbowtable[writeIdx] = obj
-                    obj.BackgroundColor3 = color
+                    pcall(function()
+                        obj.BackgroundColor3 = color
+                    end)
                 end
             end
             for clearIdx = writeIdx + 1, count do
@@ -1602,18 +1599,7 @@ do
                 ResetOnSpawn = false,
                 containerFrame,
             })
-            pcall(function()
-                if Enum and Enum.ZIndexBehavior then
-                    rootGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-                end
-            end)
             attachRootGui(rootGui)
-            if rootGui.Destroying then
-                connectSignal(rootGui.Destroying, function()
-                    rootGui = nil
-                    library:Destroy()
-                end, true)
-            end
 
             library.container = containerFrame
         end
