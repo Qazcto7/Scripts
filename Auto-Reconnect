@@ -1,0 +1,97 @@
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
+local CoreGui = game:GetService("CoreGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local isRejoining = false
+
+-- 
+local function triggerReconnectButton()
+    pcall(function()
+        local promptGui = CoreGui:FindFirstChild("RobloxPromptGui")
+        local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
+        local errorPrompt = overlay and overlay:FindFirstChild("ErrorPrompt")
+        if not errorPrompt then return end
+
+        for _, obj in ipairs(errorPrompt:GetDescendants()) do
+            if obj:IsA("GuiButton") and (obj.Name == "ReconnectButton" or obj.Text == "Reconnect") then
+                -- 1. 
+                if firesignal then
+                    pcall(firesignal, obj.MouseButton1Click)
+                    pcall(firesignal, obj.Activated)
+                end
+
+                -- 2. 
+                local inset = GuiService:GetGuiInset()
+                local pos = obj.AbsolutePosition
+                local size = obj.AbsoluteSize
+                local x = pos.X + (size.X / 2)
+                local y = pos.Y + (size.Y / 2) + inset.Y
+
+                VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                task.wait(0.05)
+                VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+                break
+            end
+        end
+    end)
+end
+
+local function attemptRejoin(reason)
+    if isRejoining then return end
+    isRejoining = true
+
+    warn("[Auto-Rejoin] Tetiklendi ->", reason or "Bilinmeyen sebep")
+
+    while true do
+        -- 
+        triggerReconnectButton()
+
+        -- 
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+
+        task.wait(5)
+    end
+end
+
+-- 1. When error message changed
+GuiService.ErrorMessageChanged:Connect(function()
+    local msg = GuiService:GetErrorMessage()
+    if msg and msg ~= "" then
+        attemptRejoin("GuiService: " .. msg)
+    end
+end)
+
+-- 2. ErrorPrompt 
+task.spawn(function()
+    local ok, promptGui = pcall(function()
+        return CoreGui:WaitForChild("RobloxPromptGui", 10)
+    end)
+    local overlay = ok and promptGui and promptGui:WaitForChild("promptOverlay", 10)
+    if overlay then
+        if overlay:FindFirstChild("ErrorPrompt") then
+            attemptRejoin("Existing ErrorPrompt detected")
+        end
+        overlay.ChildAdded:Connect(function(child)
+            if child.Name == "ErrorPrompt" then
+                task.wait(0.2) -- 
+                attemptRejoin("ErrorPrompt opened")
+            end
+        end)
+    end
+end)
+
+-- 3. Oyuncu sunucudan düşürüldüğünde
+Players.PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then
+        attemptRejoin("PlayerRemoving tetiklendi")
+    end
+end)
