@@ -1,27 +1,123 @@
--- Made by RIP#6666
 _G.Settings = {
     Players = {
-        ["Ignore Me"] = true, -- Ignore your Character
-        ["Ignore Others"] = true -- Ignore other Characters
+        ["Ignore Me"] = true,     
+        ["Ignore Others"] = true  
     },
     Meshes = {
-        Destroy = false, -- Destroy Meshes
-        LowDetail = true -- Low detail meshes (NOT SURE IT DOES ANYTHING)
+        Destroy = false,          
+        LowDetail = true          
     },
     Images = {
-        Invisible = true, -- Invisible Images
-        LowDetail = false, -- Low detail images (NOT SURE IT DOES ANYTHING)
-        Destroy = false, -- Destroy Images
+        Invisible = true,         
+        LowDetail = false,        
+        Destroy = false           
     },
     Other = {
-        ["No Particles"] = true, -- Disables all ParticleEmitter, Trail, Smoke, Fire and Sparkles
-        ["No Camera Effects"] = true, -- Disables all PostEffect's (Camera/Lighting Effects)
-        ["No Explosions"] = true, -- Makes Explosion's invisible
-        ["No Clothes"] = true, -- Removes Clothing from the game
-        ["Low Water Graphics"] = true, -- Removes Water Quality
-        ["No Shadows"] = true, -- Remove Shadows
-        ["Low Rendering"] = true, -- Lower Rendering
-        ["Low Quality Parts"] = true -- Lower quality parts
+        ["FPS Cap"] = 240,        -- Target FPS cap; set to nil to disable the cap
+        ["No Particles"] = true,  -- ParticleEmitter, Trail, Smoke, Fire, Sparkles off
+        ["No Camera Effects"] = true, -- Bloom, Blur, ColorCorrection vb. off
+        ["No Explosions"] = true, -- Patlama efektlerini 
+        ["No Clothes"] = true,    -- Kıyafet ve yüzey kaplamalarını remove
+        ["Low Water Graphics"] = true, -- Su dalga ve yansımalarını 
+        ["No Shadows"] = true,    -- Shadows completely off
+        ["Low Rendering"] = true, -- Motor render quality to 1
+        ["Low Quality Parts"] = true,  
+        ["Dynamic Optimize"] = true   
     }
 }
-loadstring(game:HttpGet("https://raw.githubusercontent.com/shravan-alt/Scripts/main/FPS%20Boost"))()
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- Service and local caching (avoids repeated table lookups)
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    error("This script must run as a LocalScript")
+end
+
+local s = _G.Settings
+local pSettings = s.Players or {}
+local mSettings = s.Meshes or {}
+local iSettings = s.Images or {}
+local oSettings = s.Other or {}
+
+local ignoreMe = pSettings["Ignore Me"]
+local ignoreOthers = pSettings["Ignore Others"]
+local meshDestroy = mSettings.Destroy
+local meshLow = mSettings.LowDetail
+local imgDestroy = iSettings.Destroy
+local imgInvisible = iSettings.Invisible
+local imgLow = iSettings.LowDetail
+
+-- Returns the top-level value if set (even false), otherwise the Other table value
+local function Get(key)
+    local v = s[key]
+    if v == nil then v = oSettings[key] end
+    return v
+end
+
+local noParticles = Get("No Particles")
+local noCamEffects = Get("No Camera Effects")
+local noExplosions = Get("No Explosions")
+local noClothes = Get("No Clothes")
+local lowWater = Get("Low Water Graphics")
+local noShadows = Get("No Shadows")
+local lowRendering = Get("Low Rendering")
+local lowParts = Get("Low Quality Parts")
+local fpsCap = Get("FPS Cap")
+
+-- Set of ignored character models (O(1) membership checks)
+local IgnoredModels = {}
+
+local function RegisterCharacter(player, char)
+    if not char then return end
+    if (player == LocalPlayer and ignoreMe) or (player ~= LocalPlayer and ignoreOthers) then
+        IgnoredModels[char] = true
+    end
+end
+
+local function TrackPlayer(player)
+    if player.Character then
+        RegisterCharacter(player, player.Character)
+    end
+    player.CharacterAdded:Connect(function(char)
+        RegisterCharacter(player, char)
+    end)
+    player.CharacterRemoving:Connect(function(char)
+        IgnoredModels[char] = nil
+    end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    TrackPlayer(player)
+end
+Players.PlayerAdded:Connect(TrackPlayer)
+
+-- Walks up the ancestor chain once, checking each against the ignore set
+local function IsIgnored(inst)
+    local current = inst
+    while current and current ~= game do
+        if current == Players or IgnoredModels[current] then
+            return true
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+-- Single-pass optimization function
+local function OptimizeInstance(inst)
+    if IsIgnored(inst) then return end
+
+    if inst:IsA("BasePart") then
+        if lowParts then
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.CastShadow = false
+        end
+    end
+    -- Remaining optimizations (meshes, images, particles, etc.) must be added here.
+end
