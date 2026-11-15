@@ -47,6 +47,16 @@ local DEFAULT_SETTINGS = {
         ["Low Rendering"] = true,
         ["Low Quality Parts"] = true,
         ["Dynamic Optimize"] = true,
+        ["No SurfaceAppearance"] = true,
+        ["No Highlights"] = true,
+        ["Disable VideoFrames"] = true,
+        ["Optimize 3D UI"] = true,
+        ["Max World UI Distance"] = 100,
+        ["Optimize Physics"] = true,
+        ["Physics Throttle"] = "Auto",
+        ["Optimize Network"] = true,
+        ["Apply FFlags"] = true,
+        ["Disable 3D Rendering"] = false,
         ["FPS Cap"] = false,
     },
 }
@@ -128,6 +138,10 @@ local Players = game:GetService("Players")
 local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+local okMat, MaterialService = pcall(game.GetService, game, "MaterialService")
+if not okMat then
+    MaterialService = nil
+end
 
 local waitTask = (type(task) == "table" and task.wait) or wait
 local spawnTask = (type(task) == "table" and task.spawn) or function(fn)
@@ -147,6 +161,7 @@ end
 
 local setHiddenProp = type(sethiddenproperty) == "function" and sethiddenproperty or nil
 local setFpsCap = type(setfpscap) == "function" and setfpscap or nil
+local setFFlagFn = type(setfflag) == "function" and setfflag or nil
 local DestroyInstance = game.Destroy
 
 local function tryGetEnum(getter)
@@ -160,6 +175,33 @@ local LOW_LOD = tryGetEnum(function() return Enum.LevelOfDetailSetting.Low end)
 local VOXEL_TECH = tryGetEnum(function() return Enum.Technology.Voxel end)
 local LOW_RENDER_QUALITY = tryGetEnum(function() return Enum.QualityLevel.Level01 end)
 local LOW_MESH_DETAIL = tryGetEnum(function() return Enum.MeshPartDetailLevel.Level01 end)
+local SAVED_LOW_QUALITY = tryGetEnum(function() return Enum.SavedQualitySetting.QualityLevel1 end)
+local INTERPOLATION_ENABLED = tryGetEnum(function() return Enum.InterpolationThrottlingMode.Enabled end)
+
+local function resolvePhysicsThrottleEnum(mode)
+    if type(mode) ~= "string" then
+        return nil
+    end
+    local key = string.lower(mode)
+    local map = {
+        auto = "DefaultAuto",
+        defaultauto = "DefaultAuto",
+        skip2 = "Skip2",
+        skip4 = "Skip4",
+        skip8 = "Skip8",
+        skip16 = "Skip16",
+        always = "Always",
+        disabled = "Disabled",
+    }
+    local enumName = map[key]
+    if not enumName then
+        return nil
+    end
+    return tryGetEnum(function()
+        local e = Enum.EnviromentalPhysicsThrottle or Enum.EnvironmentalPhysicsThrottle
+        return e[enumName]
+    end)
+end
 
 local function setPropSafe(inst, prop, value)
     inst[prop] = value
@@ -262,6 +304,21 @@ local noShadows = otherCfg["No Shadows"] == true
 local lowRendering = otherCfg["Low Rendering"] == true
 local lowQualityParts = otherCfg["Low Quality Parts"] == true
 local dynamicOptimize = otherCfg["Dynamic Optimize"] == true
+local noSurfaceAppearance = otherCfg["No SurfaceAppearance"] == true
+local noHighlights = otherCfg["No Highlights"] == true
+local disableVideoFrames = otherCfg["Disable VideoFrames"] == true
+local optimizeWorldUI = otherCfg["Optimize 3D UI"]
+local maxWorldUIDistance = tonumber(otherCfg["Max World UI Distance"]) or 100
+if maxWorldUIDistance < 10 then
+    maxWorldUIDistance = 10
+end
+local disableWorldUI = type(optimizeWorldUI) == "string"
+    and (string.lower(optimizeWorldUI) == "disable" or string.lower(optimizeWorldUI) == "off")
+local optimizePhysics = otherCfg["Optimize Physics"] == true
+local physicsThrottle = otherCfg["Physics Throttle"]
+local optimizeNetwork = otherCfg["Optimize Network"] == true
+local applyFFlags = otherCfg["Apply FFlags"] == true
+local disable3DRendering = otherCfg["Disable 3D Rendering"] == true
 local fpsCap = otherCfg["FPS Cap"]
 
 -- Weak-keyed caches avoid retaining destroyed models in memory
@@ -520,6 +577,56 @@ local function handleLight(inst)
     end
 end
 
+local function handleSurfaceAppearance(inst)
+    if noSurfaceAppearance then
+        destroySafe(inst)
+    end
+end
+
+local function handleHighlight(inst)
+    if noHighlights and inst.Enabled then
+        pcall(setPropSafe, inst, "Enabled", false)
+    end
+end
+
+local function handleVideoFrame(inst)
+    if disableVideoFrames then
+        pcall(function()
+            if inst.Playing then
+                inst.Playing = false
+            end
+            if inst.Visible then
+                inst.Visible = false
+            end
+        end)
+    end
+end
+
+local function handleWorldUI(inst)
+    if disableWorldUI then
+        if inst.Enabled then
+            pcall(setPropSafe, inst, "Enabled", false)
+        end
+        return
+    end
+    if optimizeWorldUI == true then
+        local okDist, dist = pcall(function()
+            return inst.MaxDistance
+        end)
+        if okDist and type(dist) == "number" and (dist == 0 or dist > maxWorldUIDistance) then
+            pcall(setPropSafe, inst, "MaxDistance", maxWorldUIDistance)
+        end
+        if lowRendering or lowQualityParts then
+            local okLight, li = pcall(function()
+                return inst.LightInfluence
+            end)
+            if okLight and type(li) == "number" and li ~= 0 then
+                pcall(setPropSafe, inst, "LightInfluence", 0)
+            end
+        end
+    end
+end
+
 local CLASS_HANDLERS = {
     MeshPart = handleMeshPart,
 
@@ -558,6 +665,14 @@ local CLASS_HANDLERS = {
     Shirt = handleClothing,
     Pants = handleClothing,
     ShirtGraphic = handleClothing,
+    WrapLayer = handleClothing,
+    WrapTarget = handleClothing,
+
+    SurfaceAppearance = handleSurfaceAppearance,
+    Highlight = handleHighlight,
+    VideoFrame = handleVideoFrame,
+    BillboardGui = handleWorldUI,
+    SurfaceGui = handleWorldUI,
 
     BloomEffect = handlePostEffect,
     BlurEffect = handlePostEffect,
@@ -634,8 +749,6 @@ local SKIP_CLASSES = {
     Camera = true,
     Terrain = true,
     Sky = true,
-    BillboardGui = true,
-    SurfaceGui = true,
     Frame = true,
     TextLabel = true,
     TextButton = true,
@@ -679,7 +792,7 @@ local function resolveHandler(inst, className)
         CLASS_HANDLERS[className] = handleExplosion
         CAMERA_PASS_CLASSES[className] = true
         return handleExplosion
-    elseif inst:IsA("Clothing") or inst:IsA("ShirtGraphic") then
+    elseif inst:IsA("Clothing") or inst:IsA("ShirtGraphic") or inst:IsA("WrapLayer") or inst:IsA("WrapTarget") then
         CLASS_HANDLERS[className] = handleClothing
         return handleClothing
     elseif inst:IsA("PostEffect") then
@@ -698,6 +811,18 @@ local function resolveHandler(inst, className)
     elseif inst:IsA("Light") then
         CLASS_HANDLERS[className] = handleLight
         return handleLight
+    elseif inst:IsA("Highlight") then
+        CLASS_HANDLERS[className] = handleHighlight
+        return handleHighlight
+    elseif inst:IsA("SurfaceAppearance") then
+        CLASS_HANDLERS[className] = handleSurfaceAppearance
+        return handleSurfaceAppearance
+    elseif inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
+        CLASS_HANDLERS[className] = handleWorldUI
+        return handleWorldUI
+    elseif inst:IsA("VideoFrame") then
+        CLASS_HANDLERS[className] = handleVideoFrame
+        return handleVideoFrame
     end
 
     SKIP_CLASSES[className] = true
@@ -744,6 +869,12 @@ local function applyTerrainSettings(terrain)
     end
 end
 
+local function applyFFlag(flagName, value)
+    if applyFFlags and setFFlagFn then
+        pcall(setFFlagFn, flagName, tostring(value))
+    end
+end
+
 local function applyGlobalSettings()
     if noShadows then
         pcall(setPropSafe, Lighting, "GlobalShadows", false)
@@ -751,6 +882,7 @@ local function applyGlobalSettings()
         if setHiddenProp and VOXEL_TECH then
             pcall(setHiddenProp, Lighting, "Technology", VOXEL_TECH)
         end
+        applyFFlag("FIntRenderShadowIntensity", 0)
     end
 
     if noFog then
@@ -759,6 +891,10 @@ local function applyGlobalSettings()
 
     if lowQualityParts or lowRendering then
         pcall(setPropSafe, Lighting, "EnvironmentSpecularScale", 0)
+        pcall(setPropSafe, Lighting, "EnvironmentDiffuseScale", 0)
+        if MaterialService then
+            pcall(setPropSafe, MaterialService, "Use2022Materials", false)
+        end
     end
 
     if lowRendering then
@@ -766,19 +902,68 @@ local function applyGlobalSettings()
             local rs = settings().Rendering
             if LOW_RENDER_QUALITY then
                 rs.QualityLevel = LOW_RENDER_QUALITY
+                pcall(setPropSafe, rs, "EditQualityLevel", LOW_RENDER_QUALITY)
             end
             if LOW_MESH_DETAIL then
                 pcall(setPropSafe, rs, "MeshPartDetailLevel", LOW_MESH_DETAIL)
             end
+            pcall(setPropSafe, rs, "EagerBulkExecution", false)
         end)
+        pcall(function()
+            local gs = UserSettings():GetService("UserGameSettings")
+            if gs and SAVED_LOW_QUALITY then
+                pcall(setPropSafe, gs, "SavedQualityLevel", SAVED_LOW_QUALITY)
+            end
+        end)
+        applyFFlag("FFlagDisablePostFx", "True")
+        applyFFlag("DFIntDebugFRMQualityLevelOverride", 1)
+        applyFFlag("DFFlagTextureQualityOverrideEnabled", "True")
+        applyFFlag("DFIntTextureQualityOverride", 0)
     end
 
-    if fpsCap and setFpsCap then
+    if type(RunService.Set3dRenderingEnabled) == "function" then
+        pcall(RunService.Set3dRenderingEnabled, RunService, not disable3DRendering)
+    end
+
+    if optimizePhysics then
+        pcall(function()
+            local ps = settings().Physics
+            if ps then
+                pcall(setPropSafe, ps, "AllowSleep", true)
+                local throttleEnum = resolvePhysicsThrottleEnum(physicsThrottle)
+                if throttleEnum then
+                    pcall(setPropSafe, ps, "PhysicsEnvironmentalThrottle", throttleEnum)
+                end
+            end
+        end)
+        if INTERPOLATION_ENABLED then
+            pcall(setPropSafe, Workspace, "InterpolationThrottling", INTERPOLATION_ENABLED)
+        end
+    end
+
+    if optimizeNetwork then
+        pcall(function()
+            local ns = settings().Network
+            if ns then
+                pcall(setPropSafe, ns, "IncomingReplicationLag", 0)
+            end
+        end)
+        applyFFlag("FFlagOptimizeNetworkTransport", "True")
+        applyFFlag("DFIntConnectionMTUSize", 1400)
+    end
+
+    if fpsCap then
         local capNum = tonumber(fpsCap)
         if capNum and capNum > 0 then
-            pcall(setFpsCap, capNum)
+            if setFpsCap then
+                pcall(setFpsCap, capNum)
+            end
+            applyFFlag("DFIntTaskSchedulerTargetFps", math.floor(capNum))
         elseif fpsCap == true then
-            pcall(setFpsCap, 999)
+            if setFpsCap then
+                pcall(setFpsCap, 999)
+            end
+            applyFFlag("DFIntTaskSchedulerTargetFps", 999)
         end
     end
 
