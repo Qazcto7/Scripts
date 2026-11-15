@@ -11,6 +11,7 @@ local DEFAULT_SETTINGS = {
     ExtraScripts = {},
     ExtraCode = nil,
     AFKToggleKey = nil, -- e.g. "F8" or Enum.KeyCode.F8
+    AFKDarkScreen = true, -- show dark overlay instead of Roblox's white 3D-disabled screen
     RetryHttpAttempts = 2,
     Notify = false,
 }
@@ -76,11 +77,20 @@ local state = {
     runId = runId,
     active = true,
     afkRenderDisabled = false,
+    afkOverlay = nil,
     connections = {},
 }
 
 function state.cleanup()
     state.active = false
+    if state.afkOverlay then
+        local overlay = state.afkOverlay
+        state.afkOverlay = nil
+        pcall(function()
+            overlay.Enabled = false
+            overlay:Destroy()
+        end)
+    end
     for i = #state.connections, 1, -1 do
         local conn = state.connections[i]
         state.connections[i] = nil
@@ -613,6 +623,180 @@ local function resolveKeyCode(keySpec)
 end
 
 local toggleKey = resolveKeyCode(cfg.AFKToggleKey)
+
+local OVERLAY_NAME = "__UniversalLoaderAFKOverlay"
+
+local function destroyExistingOverlay(parent)
+    if not parent or type(parent.FindFirstChild) ~= "function" then
+        return
+    end
+    pcall(function()
+        local old = parent:FindFirstChild(OVERLAY_NAME)
+        if old then
+            old:Destroy()
+        end
+    end)
+end
+
+local function getOverlayContainers()
+    local coreGui = safeGetService("CoreGui")
+    local gethuiFn = pickFirstFunction(gethui, env.gethui)
+    local hiddenUi = nil
+    if gethuiFn then
+        local okHui, resHui = pcall(gethuiFn)
+        if okHui and resHui then
+            hiddenUi = resHui
+        end
+    end
+    local playerGui = nil
+    if LocalPlayer then
+        local okPg, pg = pcall(function()
+            return LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        end)
+        if okPg and pg then
+            playerGui = pg
+        end
+    end
+    return coreGui, hiddenUi, playerGui
+end
+
+local function clearAllOverlays(coreGui, hiddenUi, playerGui)
+    destroyExistingOverlay(coreGui)
+    destroyExistingOverlay(hiddenUi)
+    destroyExistingOverlay(playerGui)
+end
+
+local function attachOverlayParent(gui, candidate, displayOrder)
+    if not candidate then
+        return false
+    end
+    local ok = pcall(function()
+        gui.DisplayOrder = displayOrder
+        gui.Parent = candidate
+    end)
+    return ok and gui.Parent == candidate
+end
+
+local function createDarkOverlay(keyObj)
+    local okInst, instLib = pcall(function()
+        return Instance
+    end)
+    if not okInst or not instLib or type(instLib.new) ~= "function" then
+        return nil
+    end
+
+    local coreGui, hiddenUi, playerGui = getOverlayContainers()
+    clearAllOverlays(coreGui, hiddenUi, playerGui)
+
+    if not coreGui and not hiddenUi and not playerGui then
+        return nil
+    end
+
+    local gui = nil
+    local okCreate = pcall(function()
+        gui = instLib.new("ScreenGui")
+        gui.Name = OVERLAY_NAME
+        gui.IgnoreGuiInset = true
+        gui.ResetOnSpawn = false
+        gui.Enabled = false
+        pcall(function()
+            if Enum and Enum.ZIndexBehavior then
+                gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+            end
+        end)
+
+        local backdrop = instLib.new("Frame")
+        backdrop.Name = "Backdrop"
+        if UDim2 and type(UDim2.new) == "function" then
+            backdrop.Size = UDim2.new(1, 0, 1, 0)
+            backdrop.Position = UDim2.new(0, 0, 0, 0)
+        end
+        backdrop.BorderSizePixel = 0
+        backdrop.BackgroundTransparency = 0
+        backdrop.Active = false
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                backdrop.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+            end
+        end)
+        backdrop.Parent = gui
+
+        local label = instLib.new("TextLabel")
+        label.Name = "Status"
+        if UDim2 and type(UDim2.new) == "function" then
+            label.Size = UDim2.new(1, -40, 0, 56)
+            label.Position = UDim2.new(0, 20, 0.5, -28)
+        end
+        label.BackgroundTransparency = 1
+        label.TextWrapped = true
+        label.TextSize = 16
+
+        local keyLabel = nil
+        if keyObj then
+            local okKeyName, kName = pcall(function()
+                return keyObj.Name
+            end)
+            if okKeyName and type(kName) == "string" and kName ~= "" then
+                keyLabel = kName
+            end
+        end
+        label.Text = keyLabel
+            and string.format("AFK Mode Active (15 FPS)\nPress %s to restore 3D view", keyLabel)
+            or "AFK Mode Active (3D Rendering Paused)"
+
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                label.TextColor3 = Color3.fromRGB(145, 150, 165)
+            end
+            if Enum and Enum.Font then
+                label.Font = Enum.Font.GothamMedium or Enum.Font.SourceSans
+            end
+        end)
+        label.Parent = backdrop
+    end)
+
+    if not okCreate or not gui then
+        return nil
+    end
+
+    local attached = attachOverlayParent(gui, coreGui, -10)
+        or attachOverlayParent(gui, hiddenUi, -10)
+        or attachOverlayParent(gui, playerGui, 2147483647)
+
+    if not attached then
+        pcall(function()
+            gui:Destroy()
+        end)
+        return nil
+    end
+    return gui
+end
+
+local function syncAfkDarkOverlay(enabled)
+    if not cfg.AFKDarkScreen or not enabled then
+        if state.afkOverlay then
+            pcall(function()
+                state.afkOverlay.Enabled = false
+            end)
+        elseif cfg.AFKDarkScreen then
+            local coreGui, hiddenUi, playerGui = getOverlayContainers()
+            clearAllOverlays(coreGui, hiddenUi, playerGui)
+        end
+        return
+    end
+
+    if not state.afkOverlay or not state.afkOverlay.Parent then
+        state.afkOverlay = createDarkOverlay(toggleKey)
+    end
+    if state.afkOverlay then
+        pcall(function()
+            state.afkOverlay.Enabled = true
+        end)
+    end
+end
+
+syncAfkDarkOverlay(state.afkRenderDisabled)
+
 if toggleKey and UserInputService and UserInputService.InputBegan then
     local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
     local optTable = env.__UniversalLoaderOwnedOpt
@@ -636,6 +820,7 @@ if toggleKey and UserInputService and UserInputService.InputBegan then
             if setFpsCapFn then
                 pcall(setFpsCapFn, state.afkRenderDisabled and 15 or restoredCap)
             end
+            syncAfkDarkOverlay(state.afkRenderDisabled)
             notify(
                 "Universal Loader",
                 state.afkRenderDisabled and "AFK mode ON (3D rendering paused)" or "AFK mode OFF (3D rendering restored)"
