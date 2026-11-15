@@ -1,5 +1,37 @@
-local VirtualUser = game:GetService('VirtualUser')
-game:GetService('Players').LocalPlayer.Idled:connect(function()
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new())
-end)
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+local VirtualUser = game:GetService("VirtualUser")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- Script tekrar çalıştırılırsa eski bağlantıyı temizle
+local env = (getgenv and getgenv()) or _G
+if env.AntiAFKConnection then
+    env.AntiAFKConnection:Disconnect()
+    env.AntiAFKConnection = nil
+end
+
+-- 1. Yöntem: Roblox'un kendi AFK atma bağlantısını doğrudan devre dışı bırak (Sıfır yan etki)
+local disabledNative = false
+if getconnections then
+    pcall(function()
+        for _, conn in ipairs(getconnections(LocalPlayer.Idled)) do
+            if conn.Disable then
+                conn:Disable()
+                disabledNative = true
+            end
+        end
+    end)
+end
+
+-- 2. Yöntem (Yedek): getconnections desteklenmiyorsa VirtualUser kullan
+if not disabledNative then
+    env.AntiAFKConnection = LocalPlayer.Idled:Connect(function()
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
+end
