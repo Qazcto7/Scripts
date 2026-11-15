@@ -1,4 +1,65 @@
-wait(10)
-game:GetService("GuiService").ErrorMessageChanged:Connect(function()
-game:GetService("TeleportService"):Teleport(game.PlaceId)
-    end);
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local isRejoining = false
+
+local function attemptRejoin(reason)
+    if isRejoining then return end
+    isRejoining = true
+
+    warn("[Auto-Rejoin] Triggered ->", reason or "Unknown reason")
+
+    while true do
+        local success, err = pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+
+        if not success then
+            warn("[Auto-Rejoin] Teleportation error, retrying:", err)
+        end
+
+        task.wait(5)
+    end
+end
+
+-- 1. 
+GuiService.ErrorMessageChanged:Connect(function()
+    local msg = GuiService:GetErrorMessage()
+    if msg and msg ~= "" then
+        attemptRejoin("GuiService: " .. msg)
+    end
+end)
+
+-- 2.
+task.spawn(function()
+    local promptGui = CoreGui:WaitForChild("RobloxPromptGui", 10)
+    local overlay = promptGui and promptGui:WaitForChild("promptOverlay", 10)
+    if overlay then
+        overlay.ChildAdded:Connect(function(child)
+            if child.Name == "ErrorPrompt" then
+                attemptRejoin("ErrorPrompt window detected")
+            end
+        end)
+    end
+end)
+
+-- 3.
+Players.PlayerRemoving:Connect(function(player)
+    if player == LocalPlayer then
+        attemptRejoin("PlayerRemoving tetiklendi")
+    end
+end)
+
+-- 4. 
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+    if player == LocalPlayer then
+        warn("[Auto-Rejoin] Teleport başarısız:", teleportResult.Name, errorMessage)
+    end
+end)
