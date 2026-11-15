@@ -170,7 +170,6 @@ local function tryGetEnum(getter)
 end
 
 local SMOOTH_PLASTIC = tryGetEnum(function() return Enum.Material.SmoothPlastic end)
-local PERF_FIDELITY = tryGetEnum(function() return Enum.RenderFidelity.Performance end)
 local LOW_LOD = tryGetEnum(function() return Enum.LevelOfDetailSetting.Low end)
 local VOXEL_TECH = tryGetEnum(function() return Enum.Technology.Voxel end)
 local LOW_RENDER_QUALITY = tryGetEnum(function() return Enum.QualityLevel.Level01 end)
@@ -461,16 +460,13 @@ local function handleMeshPart(inst)
         if inst.TextureID ~= "" then
             pcall(setPropSafe, inst, "TextureID", "")
         end
-        if PERF_FIDELITY and inst.RenderFidelity ~= PERF_FIDELITY then
-            pcall(setPropSafe, inst, "RenderFidelity", PERF_FIDELITY)
-        end
     end
     if noShadows and inst.CastShadow then
         inst.CastShadow = false
     end
 end
 
--- Note: PartOperation/SolidModel RenderFidelity is skipped at runtime because Roblox logs "Cannot change SolidModel RenderFidelity during Run-Time" even under pcall.
+-- Note: RenderFidelity on MeshPart and PartOperation/SolidModel is skipped at runtime because Roblox logs "Cannot change SolidModel RenderFidelity during Run-Time" even under pcall.
 local function handleBasePart(inst)
     if lowQualityParts then
         if SMOOTH_PLASTIC and inst.Material ~= SMOOTH_PLASTIC then
