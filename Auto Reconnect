@@ -53,13 +53,13 @@ end)
 -- 3.
 Players.PlayerRemoving:Connect(function(player)
     if player == LocalPlayer then
-        attemptRejoin("PlayerRemoving tetiklendi")
+        attemptRejoin("PlayerRemoving triggered")
     end
 end)
 
 -- 4. 
 TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
     if player == LocalPlayer then
-        warn("[Auto-Rejoin] Teleport başarısız:", teleportResult.Name, errorMessage)
+        warn("[Auto-Rejoin] Teleport unsuccessful:", teleportResult.Name, errorMessage)
     end
 end)
