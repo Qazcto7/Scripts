@@ -60,16 +60,21 @@ local spawnTask = (task and task.spawn) or function(fn, ...)
 end
 local cancelTask = (task and task.cancel) or function() end
 
+local function disconnectConn(conn)
+    if not conn then
+        return
+    end
+    pcall(function()
+        conn:Disconnect()
+    end)
+end
+
 -- Cleanup: tear down connections and loops from any previous execution
 local runId = (tonumber(env.__AutoReconnectRunId) or 0) + 1
 env.__AutoReconnectRunId = runId
 
 if type(env.__AutoReconnectState) == "table" and type(env.__AutoReconnectState.cleanup) == "function" then
     pcall(env.__AutoReconnectState.cleanup)
-end
-
-local function isRunActive()
-    return env.__AutoReconnectRunId == runId
 end
 
 local function clockNow()
@@ -145,13 +150,8 @@ function state.cleanup()
     state.isRejoining = false
 
     for i = #state.connections, 1, -1 do
-        local conn = state.connections[i]
+        disconnectConn(state.connections[i])
         state.connections[i] = nil
-        if conn then
-            pcall(function()
-                conn:Disconnect()
-            end)
-        end
     end
 
     if state.loopThread then
@@ -171,7 +171,7 @@ if not cfg.Enabled then
 end
 
 local function isActive()
-    return state.active and isRunActive()
+    return state.active and env.__AutoReconnectRunId == runId
 end
 
 local function trackConnection(signal, callback)
@@ -188,20 +188,11 @@ local function trackConnection(signal, callback)
     return nil
 end
 
-local function safeCloneRef(instance)
-    if instance and type(cloneref) == "function" then
-        local ok, cloned = pcall(cloneref, instance)
-        if ok and cloned then
-            return cloned
-        end
-    end
-    return instance
-end
-
 local function safeGetService(serviceName)
-    local ok, svc = pcall(function()
-        return safeCloneRef(game:GetService(serviceName))
-    end)
+    if not game or type(game.GetService) ~= "function" then
+        return nil
+    end
+    local ok, svc = pcall(game.GetService, game, serviceName)
     if ok then
         return svc
     end
@@ -793,7 +784,7 @@ end
 
 -- 2. RobloxPromptGui / ErrorPrompt watcher (supports delayed creation)
 if cfg.ReconnectOnErrorPrompt and CoreGui then
-    local attachedOverlays = {}
+    local attachedOverlays = type(setmetatable) == "function" and setmetatable({}, { __mode = "k" }) or {}
 
     local function attachOverlayWatcher(overlay)
         if not overlay or attachedOverlays[overlay] then

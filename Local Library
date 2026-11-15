@@ -40,6 +40,7 @@ do
     local CoreGui = safeGetService("CoreGui")
 
     local trackedConnections = {}
+    local activeCleanups = {}
     local activeTweens = setmetatable({}, { __mode = "k" })
     local tweenInfoCache = {}
     local rootGui = nil
@@ -201,11 +202,13 @@ do
         end
 
         -- Fallback for mocks or stripped environments lacking TweenService
+        local dirName = (direction and direction.Name) or "Out"
+        local styleName = (style and style.Name) or "Quint"
         if props.Size and type(obj.TweenSize) == "function" then
-            pcall(obj.TweenSize, obj, props.Size, direction.Name or "Out", style.Name or "Quint", duration, true)
+            pcall(obj.TweenSize, obj, props.Size, dirName, styleName, duration, true)
         end
         if props.Position and type(obj.TweenPosition) == "function" then
-            pcall(obj.TweenPosition, obj, props.Position, direction.Name or "Out", style.Name or "Quad", duration, true)
+            pcall(obj.TweenPosition, obj, props.Position, dirName, styleName, duration, true)
         end
         if onComplete then
             delayTask(duration, onComplete)
@@ -303,11 +306,12 @@ do
             local function stopDrag()
                 dragging = false
                 dragInputType = nil
+                activeCleanups[stopDrag] = nil
                 disconnectConn(moveConn)
                 disconnectConn(endConn)
                 moveConn = nil
                 endConn = nil
-                if queueEntry and library.toggled then
+                if not destroyed and queueEntry and library.toggled then
                     queueEntry.p = frame.Position
                 end
             end
@@ -326,10 +330,14 @@ do
                 dragInputType = uType
                 dragStart = input.Position or getMousePos()
                 startPos = frame.Position
+                activeCleanups[stopDrag] = true
 
                 if UserInputService then
                     moveConn = connectSignal(UserInputService.InputChanged, function(changedInput)
                         if not dragging or destroyed or not changedInput then
+                            if destroyed then
+                                stopDrag()
+                            end
                             return
                         end
                         if changedInput.UserInputType == Enum.UserInputType.MouseMovement
@@ -346,6 +354,10 @@ do
                     end, true)
 
                     endConn = connectSignal(UserInputService.InputEnded, function(endedInput)
+                        if destroyed then
+                            stopDrag()
+                            return
+                        end
                         if endedInput and (endedInput.UserInputType == dragInputType or endedInput.UserInputType == Enum.UserInputType.MouseButton1) then
                             stopDrag()
                         end
@@ -498,6 +510,35 @@ do
             return self.count
         end
 
+        local function createLabeledRow(container, name, order, control, rowHeight, labelPosY, extraLabelProps)
+            local labelProps = {
+                Name = name,
+                Text = "\r" .. name,
+                BackgroundTransparency = 1,
+                TextColor3 = library.options.textcolor,
+                Position = UDim2.new(0, 5, 0, labelPosY or 0),
+                Size = UDim2.new(1, -5, 1, 0),
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Font = library.options.font,
+                TextSize = library.options.fontsize,
+                TextStrokeTransparency = library.options.textstroke,
+                TextStrokeColor3 = library.options.strokecolor,
+                control,
+            }
+            if extraLabelProps then
+                for k, v in next, extraLabelProps do
+                    labelProps[k] = v
+                end
+            end
+            return library:Create("Frame", {
+                BackgroundTransparency = 1,
+                Size = UDim2.new(1, 0, 0, rowHeight or 25),
+                LayoutOrder = order,
+                library:Create("TextLabel", labelProps),
+                Parent = container,
+            })
+        end
+
         function types:Toggle(name, options, callback)
             options = options or {}
             local defaultVal = options.default or false
@@ -523,26 +564,7 @@ do
                 TextStrokeColor3 = library.options.strokecolor,
             })
 
-            library:Create("Frame", {
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 25),
-                LayoutOrder = order,
-                library:Create("TextLabel", {
-                    Name = name,
-                    Text = "\r" .. name,
-                    BackgroundTransparency = 1,
-                    TextColor3 = library.options.textcolor,
-                    Position = UDim2.new(0, 5, 0, 0),
-                    Size = UDim2.new(1, -5, 1, 0),
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    Font = library.options.font,
-                    TextSize = library.options.fontsize,
-                    TextStrokeTransparency = library.options.textstroke,
-                    TextStrokeColor3 = library.options.strokecolor,
-                    checkmark,
-                }),
-                Parent = self.container,
-            })
+            createLabeledRow(self.container, name, order, checkmark, 25, 0)
 
             local function click()
                 location[flag] = not location[flag]
@@ -646,26 +668,7 @@ do
                 PlaceholderColor3 = library.options.placeholdercolor,
             })
 
-            library:Create("Frame", {
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 25),
-                LayoutOrder = order,
-                library:Create("TextLabel", {
-                    Name = name,
-                    Text = "\r" .. name,
-                    BackgroundTransparency = 1,
-                    TextColor3 = library.options.textcolor,
-                    TextStrokeTransparency = library.options.textstroke,
-                    TextStrokeColor3 = library.options.strokecolor,
-                    Position = UDim2.new(0, 5, 0, 0),
-                    Size = UDim2.new(1, -5, 1, 0),
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    Font = library.options.font,
-                    TextSize = library.options.fontsize,
-                    box,
-                }),
-                Parent = self.container,
-            })
+            createLabeledRow(self.container, name, order, box, 25, 0)
 
             connectSignal(box.FocusLost, function(enterPressed)
                 local old = location[flag]
@@ -781,27 +784,9 @@ do
                 BorderSizePixel = 1,
             })
 
-            library:Create("Frame", {
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 30),
-                LayoutOrder = order,
-                library:Create("TextLabel", {
-                    Name = name,
-                    Text = "\r" .. name,
-                    BackgroundTransparency = 1,
-                    TextColor3 = library.options.textcolor,
-                    Position = UDim2.new(0, 5, 0, 0),
-                    Size = UDim2.new(1, -5, 1, 0),
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    Font = library.options.font,
-                    TextSize = library.options.fontsize,
-                    TextStrokeTransparency = library.options.textstroke,
-                    TextStrokeColor3 = library.options.strokecolor,
-                    BorderColor3 = library.options.bordercolor,
-                    BorderSizePixel = 1,
-                    button,
-                }),
-                Parent = self.container,
+            createLabeledRow(self.container, name, order, button, 30, 0, {
+                BorderColor3 = library.options.bordercolor,
+                BorderSizePixel = 1,
             })
 
             connectSignal(button.MouseButton1Click, function()
@@ -966,26 +951,7 @@ do
                 }),
             })
 
-            library:Create("Frame", {
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 25),
-                LayoutOrder = order,
-                library:Create("TextLabel", {
-                    Name = name,
-                    TextStrokeTransparency = library.options.textstroke,
-                    TextStrokeColor3 = library.options.strokecolor,
-                    Text = "\r" .. name,
-                    BackgroundTransparency = 1,
-                    TextColor3 = library.options.textcolor,
-                    Position = UDim2.new(0, 5, 0, 2),
-                    Size = UDim2.new(1, -5, 1, 0),
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    Font = library.options.font,
-                    TextSize = library.options.fontsize,
-                    sliderContainer,
-                }),
-                Parent = self.container,
-            })
+            createLabeledRow(self.container, name, order, sliderContainer, 25, 2)
 
             local lastCallbackValue = defaultVal
 
@@ -1024,6 +990,7 @@ do
 
             local function stopSliderDrag()
                 dragging = false
+                activeCleanups[stopSliderDrag] = nil
                 disconnectConn(moveConn)
                 disconnectConn(endConn)
                 moveConn = nil
@@ -1035,11 +1002,15 @@ do
                     return
                 end
                 dragging = true
+                activeCleanups[stopSliderDrag] = true
                 updateFromX(initialX or getMousePos().X)
 
                 if UserInputService then
                     moveConn = connectSignal(UserInputService.InputChanged, function(input)
                         if not dragging or destroyed or not input then
+                            if destroyed then
+                                stopSliderDrag()
+                            end
                             return
                         end
                         if input.UserInputType == Enum.UserInputType.MouseMovement
@@ -1050,6 +1021,10 @@ do
                     end, true)
 
                     endConn = connectSignal(UserInputService.InputEnded, function(input)
+                        if destroyed then
+                            stopSliderDrag()
+                            return
+                        end
                         if input and (input.UserInputType == Enum.UserInputType.MouseButton1
                             or input.UserInputType == Enum.UserInputType.Touch) then
                             stopSliderDrag()
@@ -1307,6 +1282,11 @@ do
             local activeContainer = nil
             local outsideConn = nil
             local dropdownToken = 0
+            local closeDropdown
+
+            local function cleanupOpenDropdown()
+                closeDropdown(false)
+            end
 
             local function isInGui(frame)
                 local mloc = getMousePos()
@@ -1320,9 +1300,10 @@ do
                 return (mouseX >= x1 and mouseX <= x2) and (mouseY >= y1 and mouseY <= y2)
             end
 
-            local function closeDropdown(animate)
+            closeDropdown = function(animate)
                 dropdownToken = dropdownToken + 1
                 local token = dropdownToken
+                activeCleanups[cleanupOpenDropdown] = nil
                 if outsideConn then
                     disconnectConn(outsideConn)
                     outsideConn = nil
@@ -1412,8 +1393,13 @@ do
                 tweenObject(container, 0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, { Size = goSize })
 
                 if UserInputService then
+                    activeCleanups[cleanupOpenDropdown] = true
                     outsideConn = connectSignal(UserInputService.InputBegan, function(a)
-                        if a and a.UserInputType == Enum.UserInputType.MouseButton1 and activeContainer and (not isInGui(activeContainer)) then
+                        if destroyed or not isObjectAlive(activeContainer) then
+                            closeDropdown(false)
+                            return
+                        end
+                        if a and a.UserInputType == Enum.UserInputType.MouseButton1 and not isInGui(activeContainer) then
                             closeDropdown(true)
                         end
                     end, true)
@@ -1552,6 +1538,15 @@ do
         library.binding = false
         globalInputConn = nil
         stopRainbowLoop()
+
+        local pendingCleanups = {}
+        for fn in next, activeCleanups do
+            pendingCleanups[#pendingCleanups + 1] = fn
+        end
+        for i = 1, #pendingCleanups do
+            pcall(pendingCleanups[i])
+        end
+        activeCleanups = {}
 
         for i = #trackedConnections, 1, -1 do
             disconnectConn(trackedConnections[i])

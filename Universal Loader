@@ -12,6 +12,11 @@ local DEFAULT_SETTINGS = {
     ExtraCode = nil,
     AFKToggleKey = nil, -- e.g. "F8" or Enum.KeyCode.F8
     AFKDarkScreen = true, -- show dark overlay instead of Roblox's white 3D-disabled screen
+    StagedExecution = true, -- stagger module loads instead of slamming frame 0
+    AntiAFKDelay = 2, -- seconds after execute before Anti-AFK loads
+    OptimizerDelay = 3, -- seconds after Anti-AFK before Optimizer loads
+    AutoReconnectDelay = 1, -- seconds after Optimizer before Auto-Reconnect loads
+    ExtraScriptsDelay = 0, -- seconds after Auto-Reconnect before ExtraScripts / ExtraCode run
     RetryHttpAttempts = 2,
     Notify = false,
 }
@@ -63,7 +68,19 @@ end
 
 local env = safeEnv()
 
-local waitTask = (task and task.wait) or wait or function() end
+local waitTask = (type(task) == "table" and type(task.wait) == "function" and task.wait) or wait or function() end
+local spawnTask = (type(task) == "table" and type(task.spawn) == "function" and task.spawn)
+    or (type(spawn) == "function" and spawn)
+    or (type(coroutine) == "table" and type(coroutine.create) == "function" and function(fn)
+        local co = coroutine.create(fn)
+        local ok, err = coroutine.resume(co)
+        if not ok and warn then
+            warn("[Universal Loader] Task error:", err)
+        end
+        return co
+    end)
+    or nil
+local cancelTask = (type(task) == "table" and type(task.cancel) == "function" and task.cancel) or nil
 local compileLua = loadstring or load
 
 local runId = (tonumber(env.__UniversalLoaderRunId) or 0) + 1
@@ -77,12 +94,21 @@ local state = {
     runId = runId,
     active = true,
     afkRenderDisabled = false,
+    afkToggledManually = false,
     afkOverlay = nil,
+    stageThread = nil,
     connections = {},
 }
 
 function state.cleanup()
     state.active = false
+    if state.stageThread then
+        local st = state.stageThread
+        state.stageThread = nil
+        if cancelTask then
+            pcall(cancelTask, st)
+        end
+    end
     if state.afkOverlay then
         local overlay = state.afkOverlay
         state.afkOverlay = nil
@@ -200,26 +226,22 @@ local cfg = mergeTables(DEFAULT_SETTINGS, userLoaderCfg)
 if type(cfg.ExtraScripts) ~= "table" then
     cfg.ExtraScripts = {}
 end
+cfg.StagedExecution = cfg.StagedExecution ~= false
+cfg.AntiAFKDelay = math.max(0, tonumber(cfg.AntiAFKDelay) or DEFAULT_SETTINGS.AntiAFKDelay)
+cfg.OptimizerDelay = math.max(0, tonumber(cfg.OptimizerDelay) or DEFAULT_SETTINGS.OptimizerDelay)
+cfg.AutoReconnectDelay = math.max(0, tonumber(cfg.AutoReconnectDelay) or DEFAULT_SETTINGS.AutoReconnectDelay)
+cfg.ExtraScriptsDelay = math.max(0, tonumber(cfg.ExtraScriptsDelay) or DEFAULT_SETTINGS.ExtraScriptsDelay)
 cfg.RetryHttpAttempts = math.max(1, math.floor(tonumber(cfg.RetryHttpAttempts) or DEFAULT_SETTINGS.RetryHttpAttempts))
 
 if not cfg.Enabled then
     return
 end
 
-local function safeCloneRef(instance)
-    if instance and type(cloneref) == "function" then
-        local ok, cloned = pcall(cloneref, instance)
-        if ok and cloned then
-            return cloned
-        end
-    end
-    return instance
-end
-
 local function safeGetService(serviceName)
-    local ok, svc = pcall(function()
-        return safeCloneRef(game:GetService(serviceName))
-    end)
+    if not game or type(game.GetService) ~= "function" then
+        return nil
+    end
+    local ok, svc = pcall(game.GetService, game, serviceName)
     if ok then
         return svc
     end
@@ -528,82 +550,26 @@ local function armTeleportQueueOnce()
     return false
 end
 
-local loadedModules = {}
-
--- 1. Anti-AFK
-if cfg.LoadAntiAFK then
-    local afkOverride = readUnownedSlot("AntiAFKSettings", "__UniversalLoaderOwnedAFK")
-    local finalAfk = mergeTables(afkOverride or {}, cfg.AntiAFKSettings)
-    if next(finalAfk) ~= nil then
-        writeConfigSlot("AntiAFKSettings", finalAfk)
-    end
-    if runUrlOrCode(cfg.BaseUrl .. "Anti-AFK", "Anti-AFK") then
-        table.insert(loadedModules, "Anti-AFK")
-    end
-    env.__UniversalLoaderOwnedAFK = env.AntiAFKSettings or (_G and _G.AntiAFKSettings)
-end
-
--- 2. Optimizer with Preset support ("Balanced" | "MaxFPS" | "AFK")
+-- Resolve initial preset & FPS cap metadata before attaching live AFK hotkey
 local presetKey = string.lower(tostring(cfg.Preset or "balanced"))
 local presetBase = PRESET_OPTIMIZER_OVERRIDES[presetKey] or PRESET_OPTIMIZER_OVERRIDES.balanced
-state.afkRenderDisabled = presetBase.Other and presetBase.Other["Disable 3D Rendering"] == true or false
-
-if cfg.LoadOptimizer then
-    local userOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
-    local finalOpt = mergeTables(presetBase, cfg.OptimizerSettings)
-    if userOpt then
-        finalOpt = mergeTables(finalOpt, userOpt)
-    end
-    if finalOpt.Other and finalOpt.Other["Disable 3D Rendering"] ~= nil then
-        state.afkRenderDisabled = finalOpt.Other["Disable 3D Rendering"] == true
-    end
-
-    writeConfigSlot("Settings", finalOpt)
-    if runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer") then
-        table.insert(loadedModules, "Optimizer")
-    end
-    env.__UniversalLoaderOwnedOpt = env.Settings or (_G and _G.Settings)
+local initialUserOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
+local initialOpt = mergeTables(presetBase, cfg.OptimizerSettings)
+if initialUserOpt then
+    initialOpt = mergeTables(initialOpt, initialUserOpt)
 end
 
--- 3. Auto-Reconnect (wired with replay code before teleport)
-if cfg.LoadAutoReconnect then
-    local userRec = readUnownedSlot("AutoReconnectSettings", "__UniversalLoaderOwnedReconnect")
-    local baseRec = {
-        QueueOnTeleport = cfg.AutoQueueOnTeleport,
-        QueueScript = replayCode,
-    }
-    local finalRec = mergeTables(baseRec, cfg.AutoReconnectSettings)
-    if userRec then
-        finalRec = mergeTables(finalRec, userRec)
-    end
+state.afkRenderDisabled = (initialOpt.Other and initialOpt.Other["Disable 3D Rendering"] == true)
+    or ((initialOpt.Other and initialOpt.Other["Disable 3D Rendering"] == nil)
+        and (presetBase.Other and presetBase.Other["Disable 3D Rendering"] == true))
+    or false
 
-    writeConfigSlot("AutoReconnectSettings", finalRec)
-    if runUrlOrCode(cfg.BaseUrl .. "Auto-Reconnect", "Auto-Reconnect") then
-        table.insert(loadedModules, "Auto-Reconnect")
-    end
-    env.__UniversalLoaderOwnedReconnect = env.AutoReconnectSettings or (_G and _G.AutoReconnectSettings)
+local restoredCap = tonumber(initialOpt.Other and initialOpt.Other["FPS Cap"]) or 999
+if (state.afkRenderDisabled and restoredCap == 15) or restoredCap <= 0 then
+    restoredCap = 999
 end
 
--- 4. Arm executor queue_on_teleport once for this server session
-local queueArmed = armTeleportQueueOnce()
-
--- 5. Optional user custom scripts / inline code (e.g. game farm scripts)
-for idx, scriptEntry in ipairs(cfg.ExtraScripts) do
-    if not isActive() then
-        break
-    end
-    if runUrlOrCode(scriptEntry, "ExtraScript#" .. tostring(idx)) then
-        table.insert(loadedModules, "Extra#" .. tostring(idx))
-    end
-end
-
-if type(cfg.ExtraCode) == "string" and cfg.ExtraCode ~= "" and isActive() then
-    if executeSource(cfg.ExtraCode, "ExtraCode") then
-        table.insert(loadedModules, "ExtraCode")
-    end
-end
-
--- 6. Optional live AFK toggle hotkey (toggles 3D rendering and FPS cap safely)
+-- Live AFK toggle hotkey & overlay helpers (toggles 3D rendering and FPS cap safely)
 local function resolveKeyCode(keySpec)
     if not Enum or not Enum.KeyCode or keySpec == nil or keySpec == false then
         return nil
@@ -623,7 +589,6 @@ local function resolveKeyCode(keySpec)
 end
 
 local toggleKey = resolveKeyCode(cfg.AFKToggleKey)
-
 local OVERLAY_NAME = "__UniversalLoaderAFKOverlay"
 
 local function destroyExistingOverlay(parent)
@@ -650,23 +615,9 @@ local function getHiddenUiContainer()
     return nil
 end
 
-local function getRawCoreGui()
-    if not game or type(game.GetService) ~= "function" then
-        return nil
-    end
-    local ok, cg = pcall(game.GetService, game, "CoreGui")
-    if ok and cg then
-        return cg
-    end
-    return nil
-end
-
 local function getOverlayContainers(allowHui)
-    local coreGui = safeGetService("CoreGui") or getRawCoreGui()
-    local hiddenUi = nil
-    if allowHui then
-        hiddenUi = getHiddenUiContainer()
-    end
+    local coreGui = safeGetService("CoreGui")
+    local hiddenUi = allowHui and getHiddenUiContainer() or nil
     local playerGui = nil
     if LocalPlayer then
         local okPg, pg = pcall(function()
@@ -706,11 +657,7 @@ local function createDarkOverlay(keyObj)
 
     local allowHui = (env.__UniversalLoaderUsedHui == true)
     local coreGui, hiddenUi, playerGui = getOverlayContainers(allowHui)
-    local rawCoreGui = getRawCoreGui()
     clearAllOverlays(coreGui, hiddenUi, playerGui)
-    if rawCoreGui and rawCoreGui ~= coreGui then
-        destroyExistingOverlay(rawCoreGui)
-    end
 
     local gui = nil
     local okCreate = pcall(function()
@@ -719,11 +666,6 @@ local function createDarkOverlay(keyObj)
         gui.IgnoreGuiInset = true
         gui.ResetOnSpawn = false
         gui.Enabled = false
-        pcall(function()
-            if Enum and Enum.ZIndexBehavior then
-                gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-            end
-        end)
 
         local backdrop = instLib.new("Frame")
         backdrop.Name = "Backdrop"
@@ -768,8 +710,8 @@ local function createDarkOverlay(keyObj)
             if Color3 and type(Color3.fromRGB) == "function" then
                 label.TextColor3 = Color3.fromRGB(145, 150, 165)
             end
-            if Enum and Enum.Font then
-                label.Font = Enum.Font.GothamMedium or Enum.Font.SourceSans
+            if Enum and Enum.Font and Enum.Font.SourceSans then
+                label.Font = Enum.Font.SourceSans
             end
         end)
         label.Parent = backdrop
@@ -780,7 +722,6 @@ local function createDarkOverlay(keyObj)
     end
 
     local attached = attachOverlayParent(gui, coreGui, -10)
-        or (rawCoreGui and rawCoreGui ~= coreGui and attachOverlayParent(gui, rawCoreGui, -10))
         or attachOverlayParent(gui, playerGui, 2147483647)
 
     if not attached then
@@ -829,25 +770,19 @@ local function syncAfkDarkOverlay(enabled)
     end
 end
 
+-- Arm teleport replay and live F8 AFK hotkey immediately before staged module execution
+local queueArmed = armTeleportQueueOnce()
 syncAfkDarkOverlay(state.afkRenderDisabled)
 
 if toggleKey and UserInputService and UserInputService.InputBegan then
     local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
-    local optTable = env.__UniversalLoaderOwnedOpt
-    local restoredCap = tonumber(optTable and optTable.Other and optTable.Other["FPS Cap"]) or 999
-    if state.afkRenderDisabled and restoredCap == 15 then
-        restoredCap = 999
-    end
-    if restoredCap <= 0 then
-        restoredCap = 999
-    end
-
     trackConnection(UserInputService.InputBegan, function(input, gameProcessed)
         if not isActive() or gameProcessed or not input then
             return
         end
         if input.KeyCode == toggleKey then
             state.afkRenderDisabled = not state.afkRenderDisabled
+            state.afkToggledManually = true
             if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
                 pcall(RunService.Set3dRenderingEnabled, RunService, not state.afkRenderDisabled)
             end
@@ -863,14 +798,127 @@ if toggleKey and UserInputService and UserInputService.InputBegan then
     end)
 end
 
-notify(
-    "Universal Loader",
-    string.format("Loaded (%s)%s", tostring(cfg.Preset), queueArmed and " + Queue armed" or "")
-)
+local function waitStage(seconds)
+    if not isActive() then
+        return false
+    end
+    if cfg.StagedExecution and seconds > 0 then
+        waitTask(seconds)
+    end
+    return isActive()
+end
 
-print(string.format(
-    "[Universal Loader] Loaded! Preset=%s | Queue=%s | Modules=%s",
-    tostring(cfg.Preset),
-    queueArmed and "Armed" or "Skipped",
-    #loadedModules > 0 and table.concat(loadedModules, ", ") or "None"
-))
+local function runModulesPipeline()
+    local loadedModules = {}
+
+    -- 1. Anti-AFK (delayed slightly after script injection)
+    if cfg.LoadAntiAFK and waitStage(cfg.AntiAFKDelay) then
+        local afkOverride = readUnownedSlot("AntiAFKSettings", "__UniversalLoaderOwnedAFK")
+        local finalAfk = mergeTables(afkOverride or {}, cfg.AntiAFKSettings)
+        if next(finalAfk) ~= nil then
+            writeConfigSlot("AntiAFKSettings", finalAfk)
+        end
+        if runUrlOrCode(cfg.BaseUrl .. "Anti-AFK", "Anti-AFK") then
+            table.insert(loadedModules, "Anti-AFK")
+        end
+        env.__UniversalLoaderOwnedAFK = env.AntiAFKSettings or (_G and _G.AntiAFKSettings)
+    end
+
+    if not isActive() then
+        return
+    end
+
+    -- 2. Optimizer (runs after Anti-AFK settles, respecting any live AFK toggle made in the meantime)
+    if cfg.LoadOptimizer and waitStage(cfg.OptimizerDelay) then
+        local userOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
+        local finalOpt = mergeTables(presetBase, cfg.OptimizerSettings)
+        if userOpt then
+            finalOpt = mergeTables(finalOpt, userOpt)
+        end
+        finalOpt.Other = finalOpt.Other or {}
+
+        local explicitCap = tonumber(finalOpt.Other["FPS Cap"])
+        if explicitCap and explicitCap > 0 and not (state.afkRenderDisabled and explicitCap == 15) then
+            restoredCap = explicitCap
+        end
+
+        if state.afkToggledManually then
+            finalOpt.Other["Disable 3D Rendering"] = state.afkRenderDisabled
+            if state.afkRenderDisabled then
+                finalOpt.Other["FPS Cap"] = 15
+            else
+                finalOpt.Other["FPS Cap"] = (restoredCap ~= 999) and restoredCap or false
+            end
+        elseif finalOpt.Other["Disable 3D Rendering"] ~= nil then
+            state.afkRenderDisabled = finalOpt.Other["Disable 3D Rendering"] == true
+        end
+
+        writeConfigSlot("Settings", finalOpt)
+        if runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer") then
+            table.insert(loadedModules, "Optimizer")
+        end
+        env.__UniversalLoaderOwnedOpt = env.Settings or (_G and _G.Settings)
+    end
+
+    if not isActive() then
+        return
+    end
+
+    -- 3. Auto-Reconnect (after Optimizer)
+    if cfg.LoadAutoReconnect and waitStage(cfg.AutoReconnectDelay) then
+        local userRec = readUnownedSlot("AutoReconnectSettings", "__UniversalLoaderOwnedReconnect")
+        local baseRec = {
+            QueueOnTeleport = cfg.AutoQueueOnTeleport,
+            QueueScript = replayCode,
+        }
+        local finalRec = mergeTables(baseRec, cfg.AutoReconnectSettings)
+        if userRec then
+            finalRec = mergeTables(finalRec, userRec)
+        end
+
+        writeConfigSlot("AutoReconnectSettings", finalRec)
+        if runUrlOrCode(cfg.BaseUrl .. "Auto-Reconnect", "Auto-Reconnect") then
+            table.insert(loadedModules, "Auto-Reconnect")
+        end
+        env.__UniversalLoaderOwnedReconnect = env.AutoReconnectSettings or (_G and _G.AutoReconnectSettings)
+    end
+
+    -- 4. Optional user custom scripts / inline code
+    local hasExtras = (#cfg.ExtraScripts > 0) or (type(cfg.ExtraCode) == "string" and cfg.ExtraCode ~= "")
+    if hasExtras and waitStage(cfg.ExtraScriptsDelay) then
+        for idx, scriptEntry in ipairs(cfg.ExtraScripts) do
+            if not isActive() then
+                break
+            end
+            if runUrlOrCode(scriptEntry, "ExtraScript#" .. tostring(idx)) then
+                table.insert(loadedModules, "Extra#" .. tostring(idx))
+            end
+        end
+
+        if type(cfg.ExtraCode) == "string" and cfg.ExtraCode ~= "" and isActive() then
+            if executeSource(cfg.ExtraCode, "ExtraCode") then
+                table.insert(loadedModules, "ExtraCode")
+            end
+        end
+    end
+
+    if isActive() then
+        state.stageThread = nil
+        notify(
+            "Universal Loader",
+            string.format("Loaded (%s)%s", tostring(cfg.Preset), queueArmed and " + Queue armed" or "")
+        )
+        print(string.format(
+            "[Universal Loader] Loaded! Preset=%s | Queue=%s | Modules=%s",
+            tostring(cfg.Preset),
+            queueArmed and "Armed" or "Skipped",
+            #loadedModules > 0 and table.concat(loadedModules, ", ") or "None"
+        ))
+    end
+end
+
+if cfg.StagedExecution and spawnTask then
+    state.stageThread = spawnTask(runModulesPipeline)
+else
+    runModulesPipeline()
+end

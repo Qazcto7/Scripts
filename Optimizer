@@ -3,7 +3,8 @@ if not game:IsLoaded() then
 end
 
 local env = (type(getgenv) == "function" and getgenv()) or _G
-local runId = os.clock()
+local runId = (tonumber(env.__OptimizerRunId) or 0) + 1
+env.__OptimizerRunId = runId
 
 if type(env.__OptimizerState) == "table" and type(env.__OptimizerState.cleanup) == "function" then
     pcall(env.__OptimizerState.cleanup)
@@ -55,7 +56,7 @@ local DEFAULT_SETTINGS = {
         ["Optimize Physics"] = true,
         ["Physics Throttle"] = "Auto",
         ["Optimize Network"] = true,
-        ["Apply FFlags"] = true,
+        ["Apply FFlags"] = false, -- Opt-in only: runtime setfflag hooks can destabilize some clients/executors
         ["Disable 3D Rendering"] = false,
         ["FPS Cap"] = false,
     },
@@ -134,22 +135,37 @@ if type(getgenv) == "function" then
     end
 end
 
-local Players = game:GetService("Players")
-local Lighting = game:GetService("Lighting")
-local Workspace = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
-local okMat, MaterialService = pcall(game.GetService, game, "MaterialService")
-if not okMat then
-    MaterialService = nil
+local function safeGetService(serviceName)
+    if not game or type(game.GetService) ~= "function" then
+        return nil
+    end
+    local ok, svc = pcall(game.GetService, game, serviceName)
+    if ok then
+        return svc
+    end
+    return nil
+end
+
+local Players = safeGetService("Players")
+local Lighting = safeGetService("Lighting")
+local Workspace = safeGetService("Workspace")
+local RunService = safeGetService("RunService")
+local MaterialService = safeGetService("MaterialService")
+
+if not (Players and Lighting and Workspace and RunService) then
+    error("[Optimizer] Core Roblox services unavailable")
 end
 
 local waitTask = (type(task) == "table" and task.wait) or wait
 local spawnTask = (type(task) == "table" and task.spawn) or function(fn)
-    local ok, err = coroutine.resume(coroutine.create(fn))
+    local co = coroutine.create(fn)
+    local ok, err = coroutine.resume(co)
     if not ok then
         warn("[Optimizer] Task error:", err)
     end
+    return co
 end
+local cancelTask = type(task) == "table" and type(task.cancel) == "function" and task.cancel or nil
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -202,21 +218,35 @@ local function resolvePhysicsThrottleEnum(mode)
     end)
 end
 
-local function setPropSafe(inst, prop, value)
+local function rawAssignProp(inst, prop, value)
     inst[prop] = value
+end
+
+local function setPropSafe(inst, prop, value)
+    return pcall(rawAssignProp, inst, prop, value)
 end
 
 local function destroySafe(inst)
     pcall(DestroyInstance, inst)
 end
 
+local function disconnectConn(conn)
+    if not conn then
+        return
+    end
+    pcall(function()
+        conn:Disconnect()
+    end)
+end
+
 -- State & cleanup management for safe re-execution
 local connections = {}
 local playerConnections = {}
 local pendingQueue = {}
-local pendingSet = {}
+local pendingSet = setmetatable({}, { __mode = "k" })
 local queueHead = 1
 local queueTail = 0
+local scanThread = nil
 local isCleanedUp = false
 
 local state = {
@@ -224,7 +254,7 @@ local state = {
 }
 
 local function isActive()
-    return (not isCleanedUp) and env.__OptimizerState == state
+    return (not isCleanedUp) and env.__OptimizerState == state and env.__OptimizerRunId == runId
 end
 
 local function trackConnection(conn)
@@ -238,7 +268,7 @@ local function disconnectPlayer(player)
     local list = playerConnections[player]
     if list then
         for i = 1, #list do
-            pcall(function() list[i]:Disconnect() end)
+            disconnectConn(list[i])
         end
         playerConnections[player] = nil
     end
@@ -249,16 +279,19 @@ state.cleanup = function()
         return
     end
     isCleanedUp = true
-    for i = 1, #connections do
-        local conn = connections[i]
-        pcall(function() conn:Disconnect() end)
+    for i = #connections, 1, -1 do
+        disconnectConn(connections[i])
+        connections[i] = nil
     end
-    connections = {}
     for player in pairs(playerConnections) do
         disconnectPlayer(player)
     end
+    if scanThread and cancelTask then
+        pcall(cancelTask, scanThread)
+    end
+    scanThread = nil
     pendingQueue = {}
-    pendingSet = {}
+    pendingSet = setmetatable({}, { __mode = "k" })
     queueHead = 1
     queueTail = 0
 end
@@ -419,8 +452,8 @@ local function isIgnored(inst, className)
             return true
         end
         if (ignoreMe or ignoreOthers) and node.ClassName == "Model" and not NonPlayerModels[node] then
-            local plr = Players:GetPlayerFromCharacter(node)
-            if plr then
+            local okPlr, plr = pcall(Players.GetPlayerFromCharacter, Players, node)
+            if okPlr and plr then
                 local ignore = (plr == LocalPlayer and ignoreMe) or (plr ~= LocalPlayer and ignoreOthers)
                 if ignore then
                     IgnoredCharacters[node] = true
@@ -843,8 +876,8 @@ local function optimizeInstance(inst)
         return false
     end
 
-    handler(inst)
-    return true
+    local ok = pcall(handler, inst)
+    return ok
 end
 
 local function applyTerrainSettings(terrain)
@@ -974,9 +1007,7 @@ local function applyGlobalSettings()
                 local t = Workspace:FindFirstChildOfClass("Terrain")
                 if t then
                     applyTerrainSettings(t)
-                    if terrainConn then
-                        pcall(function() terrainConn:Disconnect() end)
-                    end
+                    disconnectConn(terrainConn)
                 end
             end))
         end
@@ -1070,6 +1101,9 @@ local function scanContainer(container, budget)
             if elapsed >= budget then
                 workTime = workTime + elapsed
                 waitTask()
+                if not isActive() then
+                    return total, optimized, workTime
+                end
                 sliceStart = os.clock()
             end
         end
@@ -1098,7 +1132,7 @@ if Workspace.CurrentCamera then
 end
 
 -- Scan full Lighting & Workspace across frames without freezing the client
-spawnTask(function()
+scanThread = spawnTask(function()
     if not isActive() then
         return
     end
@@ -1108,6 +1142,7 @@ spawnTask(function()
     end
     local wTotal, wOpt, wWork = scanContainer(Workspace, INITIAL_FRAME_BUDGET)
     if isActive() then
+        scanThread = nil
         print(string.format(
             "Optimizer script successfully loaded! (%d/%d instances optimized in %.2fms CPU)",
             lOpt + wOpt,
