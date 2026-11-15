@@ -1,0 +1,657 @@
+local DEFAULT_SETTINGS = {
+    Enabled = true,
+    Preset = "Balanced", -- "Balanced" | "MaxFPS" | "AFK"
+    BaseUrl = "https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/",
+    LoaderUrl = "https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/Universal%20Loader",
+    LoadAntiAFK = true,
+    LoadOptimizer = true,
+    LoadAutoReconnect = true,
+    AutoQueueOnTeleport = true,
+    QueueExtraScripts = true,
+    ExtraScripts = {},
+    ExtraCode = nil,
+    AFKToggleKey = nil, -- e.g. "F8" or Enum.KeyCode.F8
+    RetryHttpAttempts = 2,
+    Notify = false,
+}
+
+local PRESET_OPTIMIZER_OVERRIDES = {
+    balanced = {
+        Other = {
+            ["Optimize 3D UI"] = true,
+            ["Physics Throttle"] = "Auto",
+            ["Disable 3D Rendering"] = false,
+        },
+    },
+    maxfps = {
+        Meshes = { Destroy = false, LowDetail = true },
+        Images = { Invisible = false, Destroy = true },
+        Particles = { Invisible = false, Destroy = true },
+        MeshParts = { LowerQuality = true, Invisible = false, Destroy = false },
+        Other = {
+            ["No Beams"] = true,
+            ["Optimize 3D UI"] = "Disable",
+            ["Physics Throttle"] = "Skip2",
+            ["Disable 3D Rendering"] = false,
+        },
+    },
+    afk = {
+        Meshes = { Destroy = false, LowDetail = true },
+        Images = { Invisible = false, Destroy = true },
+        Particles = { Invisible = false, Destroy = true },
+        MeshParts = { LowerQuality = true, Invisible = false, Destroy = false },
+        Other = {
+            ["No Beams"] = true,
+            ["Optimize 3D UI"] = "Disable",
+            ["Physics Throttle"] = "Skip4",
+            ["Disable 3D Rendering"] = true,
+            ["FPS Cap"] = 15,
+        },
+    },
+}
+
+local function safeEnv()
+    if type(getgenv) == "function" then
+        local ok, genv = pcall(getgenv)
+        if ok and type(genv) == "table" then
+            return genv
+        end
+    end
+    return _G
+end
+
+local env = safeEnv()
+
+local waitTask = (task and task.wait) or wait or function() end
+local compileLua = loadstring or load
+
+local runId = (tonumber(env.__UniversalLoaderRunId) or 0) + 1
+env.__UniversalLoaderRunId = runId
+
+if type(env.__UniversalLoaderState) == "table" and type(env.__UniversalLoaderState.cleanup) == "function" then
+    pcall(env.__UniversalLoaderState.cleanup)
+end
+
+local state = {
+    runId = runId,
+    active = true,
+    afkRenderDisabled = false,
+    connections = {},
+}
+
+function state.cleanup()
+    state.active = false
+    for i = #state.connections, 1, -1 do
+        local conn = state.connections[i]
+        state.connections[i] = nil
+        if conn then
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+    end
+end
+
+env.__UniversalLoaderState = state
+
+local function isActive()
+    return state.active and env.__UniversalLoaderRunId == runId
+end
+
+local function trackConnection(signal, callback)
+    if not signal then
+        return nil
+    end
+    local ok, conn = pcall(function()
+        return signal:Connect(callback)
+    end)
+    if ok and conn then
+        table.insert(state.connections, conn)
+        return conn
+    end
+    return nil
+end
+
+local function deepCopy(val, visited)
+    if type(val) ~= "table" then
+        return val
+    end
+    visited = visited or {}
+    if visited[val] then
+        return visited[val]
+    end
+    local out = {}
+    visited[val] = out
+    for k, v in pairs(val) do
+        out[k] = deepCopy(v, visited)
+    end
+    return out
+end
+
+local function mergeTables(base, overrides)
+    local result = type(base) == "table" and deepCopy(base) or {}
+    if type(overrides) ~= "table" then
+        return result
+    end
+    for k, v in pairs(overrides) do
+        if type(v) == "table" and type(result[k]) == "table" then
+            result[k] = mergeTables(result[k], v)
+        elseif type(v) == "table" then
+            result[k] = deepCopy(v)
+        else
+            result[k] = v
+        end
+    end
+    return result
+end
+
+local function readConfigSlot(slotName)
+    local gVal = _G and _G[slotName]
+    local eVal = env[slotName]
+    if type(gVal) == "table" and type(eVal) == "table" and gVal ~= eVal then
+        return mergeTables(gVal, eVal)
+    elseif type(eVal) == "table" then
+        return deepCopy(eVal)
+    elseif type(gVal) == "table" then
+        return deepCopy(gVal)
+    end
+    return {}
+end
+
+local function readUnownedSlot(slotName, ownedTagName)
+    local owned = env[ownedTagName]
+    local gVal = _G and _G[slotName]
+    local eVal = env[slotName]
+    local useG = type(gVal) == "table" and gVal ~= owned
+    local useE = type(eVal) == "table" and eVal ~= owned
+
+    if useG and useE and gVal ~= eVal then
+        return mergeTables(gVal, eVal)
+    elseif useE then
+        return deepCopy(eVal)
+    elseif useG then
+        return deepCopy(gVal)
+    end
+    return nil
+end
+
+local function writeConfigSlot(slotName, tbl)
+    if _G then
+        _G[slotName] = tbl
+    end
+    if env ~= _G then
+        env[slotName] = tbl
+    end
+end
+
+local userLoaderCfg = readConfigSlot("UniversalLoaderSettings")
+local cfg = mergeTables(DEFAULT_SETTINGS, userLoaderCfg)
+
+if type(cfg.ExtraScripts) ~= "table" then
+    cfg.ExtraScripts = {}
+end
+cfg.RetryHttpAttempts = math.max(1, math.floor(tonumber(cfg.RetryHttpAttempts) or DEFAULT_SETTINGS.RetryHttpAttempts))
+
+if not cfg.Enabled then
+    return
+end
+
+local function safeCloneRef(instance)
+    if instance and type(cloneref) == "function" then
+        local ok, cloned = pcall(cloneref, instance)
+        if ok and cloned then
+            return cloned
+        end
+    end
+    return instance
+end
+
+local function safeGetService(serviceName)
+    local ok, svc = pcall(function()
+        return safeCloneRef(game:GetService(serviceName))
+    end)
+    if ok then
+        return svc
+    end
+    return nil
+end
+
+if game and type(game.IsLoaded) == "function" then
+    local okLoaded, loaded = pcall(function()
+        return game:IsLoaded()
+    end)
+    if okLoaded and not loaded and game.Loaded then
+        pcall(function()
+            game.Loaded:Wait()
+        end)
+    end
+end
+
+if not isActive() then
+    return
+end
+
+local Players = safeGetService("Players")
+local RunService = safeGetService("RunService")
+local UserInputService = safeGetService("UserInputService")
+local StarterGui = safeGetService("StarterGui")
+
+local LocalPlayer = Players and Players.LocalPlayer
+while Players and not LocalPlayer and isActive() do
+    waitTask(0.05)
+    LocalPlayer = Players.LocalPlayer
+end
+
+if not isActive() then
+    return
+end
+
+local function notify(title, text)
+    if not cfg.Notify or not StarterGui then
+        return
+    end
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = 4,
+        })
+    end)
+end
+
+local function pickFirstFunction(a, b, c, d, e, f, g, h)
+    if type(a) == "function" then return a end
+    if type(b) == "function" then return b end
+    if type(c) == "function" then return c end
+    if type(d) == "function" then return d end
+    if type(e) == "function" then return e end
+    if type(f) == "function" then return f end
+    if type(g) == "function" then return g end
+    if type(h) == "function" then return h end
+    return nil
+end
+
+local function getRequestFn()
+    return pickFirstFunction(
+        env.request,
+        request,
+        env.http_request,
+        http_request,
+        env.syn and env.syn.request,
+        syn and syn.request,
+        env.fluxus and env.fluxus.request,
+        fluxus and fluxus.request
+    )
+end
+
+local function getQueueOnTeleportFn()
+    return pickFirstFunction(
+        env.queue_on_teleport,
+        queue_on_teleport,
+        env.queueonteleport,
+        queueonteleport,
+        env.syn and env.syn.queue_on_teleport,
+        syn and syn.queue_on_teleport,
+        env.fluxus and env.fluxus.queue_on_teleport,
+        fluxus and fluxus.queue_on_teleport
+    )
+end
+
+local function fetchUrl(url)
+    for attempt = 1, cfg.RetryHttpAttempts do
+        if not isActive() then
+            return nil, "inactive"
+        end
+        if game and type(game.HttpGet) == "function" then
+            local ok, body = pcall(function()
+                return game:HttpGet(url, true)
+            end)
+            if ok and type(body) == "string" and body ~= "" then
+                return body
+            end
+        end
+
+        local reqFn = getRequestFn()
+        if reqFn then
+            local ok, res = pcall(reqFn, {
+                Url = url,
+                Method = "GET",
+            })
+            if ok and type(res) == "table" and type(res.Body) == "string" and res.Body ~= "" then
+                local status = tonumber(res.StatusCode)
+                if not status or (status >= 200 and status < 300) then
+                    return res.Body
+                end
+            end
+        end
+
+        if attempt < cfg.RetryHttpAttempts then
+            waitTask(0.5)
+        end
+    end
+    return nil, "HTTP fetch failed"
+end
+
+local function executeSource(source, label)
+    if type(compileLua) ~= "function" then
+        if warn then
+            warn("[Universal Loader] No loadstring/load available for " .. label)
+        end
+        return false
+    end
+    local fn, compileErr = compileLua(source)
+    if not fn then
+        if warn then
+            warn("[Universal Loader] Compile error in " .. label .. ":", compileErr)
+        end
+        return false
+    end
+    local ok, runErr = pcall(fn)
+    if not ok then
+        if warn then
+            warn("[Universal Loader] Runtime error in " .. label .. ":", runErr)
+        end
+        return false
+    end
+    return true
+end
+
+local function runUrlOrCode(entry, label)
+    if type(entry) ~= "string" or entry == "" then
+        return false
+    end
+    local trimmed = entry:match("^%s*(.-)%s*$") or ""
+    if trimmed:match("^https?://") then
+        local src, fetchErr = fetchUrl(trimmed)
+        if not src then
+            if warn then
+                warn("[Universal Loader] Failed to fetch " .. label .. ":", fetchErr)
+            end
+            return false
+        end
+        return executeSource(src, label)
+    end
+    return executeSource(entry, label)
+end
+
+local function quoteString(str)
+    return '"' .. str
+        :gsub("\\", "\\\\")
+        :gsub('"', '\\"')
+        :gsub("\r", "\\r")
+        :gsub("\n", "\\n")
+        :gsub("\t", "\\t")
+        :gsub("%z", "\\000") .. '"'
+end
+
+local function serializeValue(val, visited, depth)
+    depth = depth or 0
+    if depth > 8 then
+        return nil
+    end
+
+    local t = type(val)
+    if t == "boolean" then
+        return tostring(val)
+    elseif t == "number" then
+        if val ~= val or val == math.huge or val == -math.huge then
+            return nil
+        end
+        return tostring(val)
+    elseif t == "string" then
+        return quoteString(val)
+    elseif t == "userdata" then
+        -- Serialize EnumItem cleanly (e.g. Enum.KeyCode.F8 -> "F8")
+        local okName, name = pcall(function()
+            return val.Name
+        end)
+        if okName and type(name) == "string" then
+            return quoteString(name)
+        end
+        return nil
+    elseif t == "table" then
+        visited = visited or {}
+        if visited[val] then
+            return nil
+        end
+        visited[val] = true
+
+        local parts = {}
+        local usedArrayIdx = {}
+        for i = 1, #val do
+            local serialized = serializeValue(val[i], visited, depth + 1)
+            if serialized ~= nil then
+                usedArrayIdx[i] = true
+                table.insert(parts, serialized)
+            end
+        end
+
+        for k, v in pairs(val) do
+            local isUsedArray = type(k) == "number" and usedArrayIdx[k]
+            if not isUsedArray and (type(k) == "string" or type(k) == "number") then
+                local serializedVal = serializeValue(v, visited, depth + 1)
+                if serializedVal ~= nil then
+                    local keyExpr = type(k) == "string" and ("[" .. quoteString(k) .. "]") or ("[" .. tostring(k) .. "]")
+                    table.insert(parts, keyExpr .. "=" .. serializedVal)
+                end
+            end
+        end
+
+        visited[val] = nil
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+
+    return nil
+end
+
+local function buildReplayCode()
+    if type(cfg.LoaderUrl) ~= "string" or cfg.LoaderUrl == "" then
+        return nil
+    end
+
+    local persistedLoaderCfg = deepCopy(userLoaderCfg)
+    if not cfg.QueueExtraScripts then
+        persistedLoaderCfg.ExtraScripts = {}
+        persistedLoaderCfg.ExtraCode = nil
+    end
+    persistedLoaderCfg.Preset = cfg.Preset
+    persistedLoaderCfg.BaseUrl = cfg.BaseUrl
+    persistedLoaderCfg.LoaderUrl = cfg.LoaderUrl
+
+    -- Preserve explicit sub-module overrides across teleports if present
+    local optUser = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
+    local afkUser = readUnownedSlot("AntiAFKSettings", "__UniversalLoaderOwnedAFK")
+    local recUser = readUnownedSlot("AutoReconnectSettings", "__UniversalLoaderOwnedReconnect")
+
+    local chunks = {
+        "local g=(type(getgenv)=='function' and getgenv()) or _G;",
+    }
+
+    local loaderSerialized = serializeValue(persistedLoaderCfg)
+    if loaderSerialized then
+        table.insert(chunks, "local lc=" .. loaderSerialized .. ";_G.UniversalLoaderSettings=lc;g.UniversalLoaderSettings=lc;")
+    end
+    if optUser then
+        local s = serializeValue(optUser)
+        if s then
+            table.insert(chunks, "local oc=" .. s .. ";_G.Settings=oc;g.Settings=oc;")
+        end
+    end
+    if afkUser then
+        local s = serializeValue(afkUser)
+        if s then
+            table.insert(chunks, "local ac=" .. s .. ";_G.AntiAFKSettings=ac;g.AntiAFKSettings=ac;")
+        end
+    end
+    if recUser then
+        local s = serializeValue(recUser)
+        if s then
+            table.insert(chunks, "local rc=" .. s .. ";_G.AutoReconnectSettings=rc;g.AutoReconnectSettings=rc;")
+        end
+    end
+
+    table.insert(chunks, "loadstring(game:HttpGet(" .. quoteString(cfg.LoaderUrl) .. ",true))()")
+    return table.concat(chunks, "")
+end
+
+local replayCode = buildReplayCode()
+if replayCode then
+    env.__UniversalLoaderReplayCode = replayCode
+end
+
+local function armTeleportQueueOnce()
+    if not cfg.AutoQueueOnTeleport or not replayCode then
+        return false
+    end
+    if env.__TeleportQueuedSession ~= nil and env.__TeleportQueuedSession == game then
+        return false
+    end
+    local queueFn = getQueueOnTeleportFn()
+    if not queueFn then
+        return false
+    end
+    local ok = pcall(queueFn, replayCode)
+    if ok then
+        env.__TeleportQueuedSession = game
+        return true
+    end
+    return false
+end
+
+local loadedModules = {}
+
+-- 1. Anti-AFK
+if cfg.LoadAntiAFK then
+    local afkOverride = readUnownedSlot("AntiAFKSettings", "__UniversalLoaderOwnedAFK")
+    local finalAfk = mergeTables(afkOverride or {}, cfg.AntiAFKSettings)
+    if next(finalAfk) ~= nil then
+        writeConfigSlot("AntiAFKSettings", finalAfk)
+    end
+    if runUrlOrCode(cfg.BaseUrl .. "Anti-AFK", "Anti-AFK") then
+        table.insert(loadedModules, "Anti-AFK")
+    end
+    env.__UniversalLoaderOwnedAFK = env.AntiAFKSettings or (_G and _G.AntiAFKSettings)
+end
+
+-- 2. Optimizer with Preset support ("Balanced" | "MaxFPS" | "AFK")
+local presetKey = string.lower(tostring(cfg.Preset or "balanced"))
+local presetBase = PRESET_OPTIMIZER_OVERRIDES[presetKey] or PRESET_OPTIMIZER_OVERRIDES.balanced
+state.afkRenderDisabled = presetBase.Other and presetBase.Other["Disable 3D Rendering"] == true or false
+
+if cfg.LoadOptimizer then
+    local userOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
+    local finalOpt = mergeTables(presetBase, cfg.OptimizerSettings)
+    if userOpt then
+        finalOpt = mergeTables(finalOpt, userOpt)
+    end
+    if finalOpt.Other and finalOpt.Other["Disable 3D Rendering"] ~= nil then
+        state.afkRenderDisabled = finalOpt.Other["Disable 3D Rendering"] == true
+    end
+
+    writeConfigSlot("Settings", finalOpt)
+    if runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer") then
+        table.insert(loadedModules, "Optimizer")
+    end
+    env.__UniversalLoaderOwnedOpt = env.Settings or (_G and _G.Settings)
+end
+
+-- 3. Auto-Reconnect (wired with replay code before teleport)
+if cfg.LoadAutoReconnect then
+    local userRec = readUnownedSlot("AutoReconnectSettings", "__UniversalLoaderOwnedReconnect")
+    local baseRec = {
+        QueueOnTeleport = cfg.AutoQueueOnTeleport,
+        QueueScript = replayCode,
+    }
+    local finalRec = mergeTables(baseRec, cfg.AutoReconnectSettings)
+    if userRec then
+        finalRec = mergeTables(finalRec, userRec)
+    end
+
+    writeConfigSlot("AutoReconnectSettings", finalRec)
+    if runUrlOrCode(cfg.BaseUrl .. "Auto-Reconnect", "Auto-Reconnect") then
+        table.insert(loadedModules, "Auto-Reconnect")
+    end
+    env.__UniversalLoaderOwnedReconnect = env.AutoReconnectSettings or (_G and _G.AutoReconnectSettings)
+end
+
+-- 4. Arm executor queue_on_teleport once for this server session
+local queueArmed = armTeleportQueueOnce()
+
+-- 5. Optional user custom scripts / inline code (e.g. game farm scripts)
+for idx, scriptEntry in ipairs(cfg.ExtraScripts) do
+    if not isActive() then
+        break
+    end
+    if runUrlOrCode(scriptEntry, "ExtraScript#" .. tostring(idx)) then
+        table.insert(loadedModules, "Extra#" .. tostring(idx))
+    end
+end
+
+if type(cfg.ExtraCode) == "string" and cfg.ExtraCode ~= "" and isActive() then
+    if executeSource(cfg.ExtraCode, "ExtraCode") then
+        table.insert(loadedModules, "ExtraCode")
+    end
+end
+
+-- 6. Optional live AFK toggle hotkey (toggles 3D rendering and FPS cap safely)
+local function resolveKeyCode(keySpec)
+    if not Enum or not Enum.KeyCode or keySpec == nil or keySpec == false then
+        return nil
+    end
+    if type(keySpec) == "userdata" then
+        return keySpec
+    end
+    if type(keySpec) == "string" and keySpec ~= "" then
+        local ok, key = pcall(function()
+            return Enum.KeyCode[keySpec]
+        end)
+        if ok and key then
+            return key
+        end
+    end
+    return nil
+end
+
+local toggleKey = resolveKeyCode(cfg.AFKToggleKey)
+if toggleKey and UserInputService and UserInputService.InputBegan then
+    local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
+    local optTable = env.__UniversalLoaderOwnedOpt
+    local restoredCap = tonumber(optTable and optTable.Other and optTable.Other["FPS Cap"]) or 999
+    if state.afkRenderDisabled and restoredCap == 15 then
+        restoredCap = 999
+    end
+    if restoredCap <= 0 then
+        restoredCap = 999
+    end
+
+    trackConnection(UserInputService.InputBegan, function(input, gameProcessed)
+        if not isActive() or gameProcessed or not input then
+            return
+        end
+        if input.KeyCode == toggleKey then
+            state.afkRenderDisabled = not state.afkRenderDisabled
+            if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
+                pcall(RunService.Set3dRenderingEnabled, RunService, not state.afkRenderDisabled)
+            end
+            if setFpsCapFn then
+                pcall(setFpsCapFn, state.afkRenderDisabled and 15 or restoredCap)
+            end
+            notify(
+                "Universal Loader",
+                state.afkRenderDisabled and "AFK mode ON (3D rendering paused)" or "AFK mode OFF (3D rendering restored)"
+            )
+        end
+    end)
+end
+
+notify(
+    "Universal Loader",
+    string.format("Loaded (%s)%s", tostring(cfg.Preset), queueArmed and " + Queue armed" or "")
+)
+
+print(string.format(
+    "[Universal Loader] Loaded! Preset=%s | Queue=%s | Modules=%s",
+    tostring(cfg.Preset),
+    queueArmed and "Armed" or "Skipped",
+    #loadedModules > 0 and table.concat(loadedModules, ", ") or "None"
+))

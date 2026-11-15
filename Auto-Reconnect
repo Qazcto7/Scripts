@@ -14,6 +14,9 @@ local DEFAULT_SETTINGS = {
     ReconnectOnPlayerRemoving = true,
     IgnorePlayerRemovingInMenu = true,
     WatchExistingError = true,
+    QueueOnTeleport = true,
+    QueueScript = nil,
+    QueueUrl = nil,
     IgnoredErrorPatterns = {},
     Notify = false,
 }
@@ -94,10 +97,12 @@ local function resolveConfig()
     end
 
     local userSources = { _G and _G.AutoReconnectSettings, env.AutoReconnectSettings }
-    for _, src in ipairs(userSources) do
+    for i = 1, 2 do
+        local src = userSources[i]
         if type(src) == "table" then
             for k, v in pairs(src) do
-                if DEFAULT_SETTINGS[k] ~= nil or k == "TargetPlaceId" or k == "FallbackPlaceId" then
+                if DEFAULT_SETTINGS[k] ~= nil or k == "TargetPlaceId" or k == "FallbackPlaceId"
+                    or k == "QueueScript" or k == "QueueUrl" then
                     cfg[k] = v
                 end
             end
@@ -123,6 +128,7 @@ local state = {
     runId = runId,
     active = true,
     isRejoining = false,
+    hasQueuedTeleport = false,
     sameServerAttempts = 0,
     useFallbackPlace = false,
     skipTeleportUntil = 0,
@@ -591,6 +597,67 @@ local function performTeleport()
     return okTeleport
 end
 
+local function pickFirstFunction(a, b, c, d, e, f, g, h)
+    if type(a) == "function" then return a end
+    if type(b) == "function" then return b end
+    if type(c) == "function" then return c end
+    if type(d) == "function" then return d end
+    if type(e) == "function" then return e end
+    if type(f) == "function" then return f end
+    if type(g) == "function" then return g end
+    if type(h) == "function" then return h end
+    return nil
+end
+
+local function getQueueOnTeleportFn()
+    return pickFirstFunction(
+        env.queue_on_teleport,
+        queue_on_teleport,
+        env.queueonteleport,
+        queueonteleport,
+        env.syn and env.syn.queue_on_teleport,
+        syn and syn.queue_on_teleport,
+        env.fluxus and env.fluxus.queue_on_teleport,
+        fluxus and fluxus.queue_on_teleport
+    )
+end
+
+local function queueTeleportReplayIfNeeded()
+    if not cfg.QueueOnTeleport or state.hasQueuedTeleport then
+        return false
+    end
+    if env.__TeleportQueuedSession ~= nil and env.__TeleportQueuedSession == game then
+        state.hasQueuedTeleport = true
+        return false
+    end
+
+    local payload = nil
+    if type(cfg.QueueScript) == "string" and cfg.QueueScript ~= "" then
+        payload = cfg.QueueScript
+    elseif type(cfg.QueueUrl) == "string" and cfg.QueueUrl ~= "" then
+        payload = "loadstring(game:HttpGet(" .. string.format("%q", cfg.QueueUrl) .. ", true))()"
+    elseif type(env.__UniversalLoaderReplayCode) == "string" and env.__UniversalLoaderReplayCode ~= "" then
+        payload = env.__UniversalLoaderReplayCode
+    end
+
+    if not payload then
+        return false
+    end
+
+    local queueFn = getQueueOnTeleportFn()
+    if not queueFn then
+        return false
+    end
+
+    local ok = pcall(queueFn, payload)
+    if ok then
+        state.hasQueuedTeleport = true
+        env.__TeleportQueuedSession = game
+        return true
+    end
+    return false
+end
+
 local function attemptRejoin(reason)
     if not isActive() or state.isRejoining then
         return
@@ -606,8 +673,11 @@ local function attemptRejoin(reason)
     end
     notify("Auto-Reconnect", "Reconnecting: " .. tostring(reason or "Unknown reason"))
 
+    queueTeleportReplayIfNeeded()
+
     state.loopThread = spawnTask(function()
         while isActive() and state.isRejoining do
+            queueTeleportReplayIfNeeded()
             if cfg.ClickReconnectButton then
                 triggerReconnectButton()
             end
