@@ -2,41 +2,290 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local Players = game:GetService("Players")
-local VirtualUser = game:GetService("VirtualUser")
-local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
-
-local env = (getgenv and getgenv()) or _G
+local env = (type(getgenv) == "function" and getgenv()) or _G
 local runId = os.clock()
-env.AntiAFKRunId = runId
 
+-- Clean up any previous Anti-AFK run (including legacy globals)
+if type(env.__AntiAFKState) == "table" and type(env.__AntiAFKState.cleanup) == "function" then
+    pcall(env.__AntiAFKState.cleanup)
+end
 if env.AntiAFKConnection then
-    env.AntiAFKConnection:Disconnect()
+    pcall(function()
+        env.AntiAFKConnection:Disconnect()
+    end)
     env.AntiAFKConnection = nil
 end
 
-local function simulateActivity()
+local DEFAULT_SETTINGS = {
+    Interval = 540, -- Fallback trigger interval in seconds (below 10/15/20 min AFK kicks)
+    Cooldown = 10, -- Minimum seconds between simulated activity pulses
+    DisableNativeIdled = true, -- Disable pre-existing Idled listeners when getconnections exists
+    UseVirtualUser = true, -- Simulate non-intrusive VirtualUser activity
+    UseVirtualInputManager = true, -- Tap unbound F15 key for UserInputService activity checks
+    MicroJump = false, -- Optional jump pulse for games with server-side movement checks
+    Notify = false, -- Optional StarterGui notification on load
+}
+
+local function mergeSettings(defaults, overrides)
+    overrides = type(overrides) == "table" and overrides or {}
+    local result = {}
+    for key, default in pairs(defaults) do
+        local override = overrides[key]
+        if override ~= nil then
+            result[key] = override
+        else
+            result[key] = default
+        end
+    end
+    return result
+end
+
+local userSettings = (type(_G.AntiAFKSettings) == "table" and _G.AntiAFKSettings)
+    or (env ~= _G and type(env.AntiAFKSettings) == "table" and env.AntiAFKSettings)
+    or nil
+
+local cfg = mergeSettings(DEFAULT_SETTINGS, userSettings)
+cfg.Interval = math.max(15, tonumber(cfg.Interval) or DEFAULT_SETTINGS.Interval)
+cfg.Cooldown = math.max(1, tonumber(cfg.Cooldown) or DEFAULT_SETTINGS.Cooldown)
+
+_G.AntiAFKSettings = cfg
+if env ~= _G and type(env.AntiAFKSettings) == "table" then
+    env.AntiAFKSettings = cfg
+end
+
+local cloneRef = type(cloneref) == "function" and cloneref or function(inst)
+    return inst
+end
+
+local function safeGetService(name)
+    local ok, service = pcall(game.GetService, game, name)
+    if ok and service then
+        return cloneRef(service)
+    end
+    return nil
+end
+
+local Players = safeGetService("Players")
+if not Players then
+    error("[Anti-AFK] Players service unavailable")
+end
+
+local waitTask = (type(task) == "table" and task.wait) or wait
+local spawnTask = (type(task) == "table" and task.spawn) or function(fn)
+    local co = coroutine.create(fn)
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        warn("[Anti-AFK] Task error:", err)
+    end
+    return co
+end
+local cancelTask = type(task) == "table" and type(task.cancel) == "function" and task.cancel or nil
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    repeat
+        waitTask()
+        LocalPlayer = Players.LocalPlayer
+    until LocalPlayer
+end
+
+local Workspace = safeGetService("Workspace")
+local VirtualUser = safeGetService("VirtualUser")
+local VirtualInputManager = safeGetService("VirtualInputManager")
+local UserInputService = safeGetService("UserInputService")
+local StarterGui = safeGetService("StarterGui")
+
+local getConns = (type(getconnections) == "function" and getconnections)
+    or (type(get_signal_cons) == "function" and get_signal_cons)
+    or nil
+
+local F15_KEY = (function()
+    local ok, val = pcall(function()
+        return Enum.KeyCode.F15
+    end)
+    return ok and val or nil
+end)()
+
+local connections = {}
+local isCleanedUp = false
+local isSimulating = false
+local lastActivity = os.clock()
+local lastSimulatedAt = -math.huge
+local loopThread = nil
+local idledHandler = nil
+
+local state = {
+    runId = runId,
+}
+
+local function isActive()
+    return (not isCleanedUp) and env.__AntiAFKState == state
+end
+
+local function trackConnection(conn)
+    if conn then
+        connections[#connections + 1] = conn
+    end
+    return conn
+end
+
+state.cleanup = function()
+    if isCleanedUp then
+        return
+    end
+    isCleanedUp = true
+    for i = 1, #connections do
+        local conn = connections[i]
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    connections = {}
+    if loopThread and cancelTask then
+        pcall(cancelTask, loopThread)
+    end
+    loopThread = nil
+    if env.AntiAFKRunId == runId then
+        env.AntiAFKRunId = nil
+    end
+    env.AntiAFKConnection = nil
+end
+
+env.__AntiAFKState = state
+env.AntiAFKRunId = runId
+
+local function disableExistingIdledConnections()
+    if not (cfg.DisableNativeIdled and getConns) then
+        return
+    end
     pcall(function()
-        local cam = workspace.CurrentCamera
-        local cf = cam and cam.CFrame or CFrame.new()
-        VirtualUser:CaptureController()
-        VirtualUser:Button2Down(Vector2.new(0, 0), cf)
-        task.wait(0.1)
-        VirtualUser:Button2Up(Vector2.new(0, 0), cf)
+        local list = getConns(LocalPlayer.Idled)
+        if type(list) ~= "table" then
+            return
+        end
+        for _, conn in ipairs(list) do
+            if conn and conn.Function ~= idledHandler then
+                if conn.Disable then
+                    pcall(conn.Disable, conn)
+                elseif conn.Disconnect then
+                    pcall(conn.Disconnect, conn)
+                end
+            end
+        end
     end)
 end
 
--- 1. 
-env.AntiAFKConnection = LocalPlayer.Idled:Connect(simulateActivity)
+local function simulateActivity()
+    if not isActive() or isSimulating then
+        return false
+    end
 
--- 2. 
-task.spawn(function()
-    while env.AntiAFKRunId == runId and LocalPlayer.Parent do
-        task.wait(720) --
-        if env.AntiAFKRunId == runId and LocalPlayer.Parent then
+    local now = os.clock()
+    if (now - lastSimulatedAt) < cfg.Cooldown then
+        return false
+    end
+
+    isSimulating = true
+    lastSimulatedAt = now
+    lastActivity = now
+
+    local ok, err = pcall(function()
+        if cfg.UseVirtualUser and VirtualUser then
+            local cam = Workspace and Workspace.CurrentCamera
+            local cf = (cam and cam.CFrame) or (CFrame and CFrame.new())
+            local zeroVec = Vector2 and Vector2.new(0, 0)
+            local pulseOk = pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:Button2Down(zeroVec, cf)
+                waitTask(0.05)
+                VirtualUser:Button2Up(zeroVec, cf)
+            end)
+            if not pulseOk then
+                pcall(function()
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(zeroVec)
+                end)
+            end
+        end
+
+        if cfg.UseVirtualInputManager and VirtualInputManager and F15_KEY then
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, F15_KEY, false, game)
+                waitTask(0.02)
+                VirtualInputManager:SendKeyEvent(false, F15_KEY, false, game)
+            end)
+        end
+
+        if cfg.MicroJump then
+            pcall(function()
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    hum.Jump = true
+                end
+            end)
+        end
+    end)
+
+    isSimulating = false
+    lastActivity = os.clock()
+
+    if not ok then
+        warn("[Anti-AFK] Simulation error:", err)
+    end
+    return ok
+end
+
+idledHandler = function()
+    if not isActive() then
+        return
+    end
+    disableExistingIdledConnections()
+    simulateActivity()
+end
+
+-- 1. Disable built-in / existing Idled connections first, then attach fallback listener
+disableExistingIdledConnections()
+local idledConn = trackConnection(LocalPlayer.Idled:Connect(idledHandler))
+env.AntiAFKConnection = idledConn
+
+-- 2. Track real player input so periodic pulses never interrupt active gameplay
+if UserInputService then
+    local function markUserActive()
+        if isActive() and not isSimulating then
+            lastActivity = os.clock()
+        end
+    end
+    if UserInputService.InputBegan then
+        trackConnection(UserInputService.InputBegan:Connect(markUserActive))
+    end
+    if UserInputService.InputChanged then
+        trackConnection(UserInputService.InputChanged:Connect(markUserActive))
+    end
+end
+
+-- 3. Periodic idle fallback loop (handles games/executors where Idled is bypassed or custom)
+local checkStep = math.min(60, cfg.Interval)
+loopThread = spawnTask(function()
+    while isActive() and LocalPlayer.Parent do
+        waitTask(checkStep)
+        if not isActive() or not LocalPlayer.Parent then
+            break
+        end
+        if (os.clock() - lastActivity) >= cfg.Interval then
             simulateActivity()
         end
     end
 end)
 
+if cfg.Notify and StarterGui then
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Anti-AFK",
+            Text = "Universal Anti-AFK enabled.",
+            Duration = 4,
+        })
+    end)
+end
 
+print("[Anti-AFK] Universal Anti-AFK successfully loaded!")

@@ -1,97 +1,827 @@
-if not game:IsLoaded() then
-    game.Loaded:Wait()
+local DEFAULT_SETTINGS = {
+    Enabled = true,
+    PreferSameServer = false,
+    MaxSameServerAttempts = 2,
+    TargetPlaceId = nil,
+    FallbackPlaceId = nil,
+    RetryDelay = 5,
+    FloodedDelay = 12,
+    PromptDelay = 0.25,
+    PlayerRemovingDelay = 0.35,
+    ClickReconnectButton = true,
+    ReconnectOnErrorMessage = true,
+    ReconnectOnErrorPrompt = true,
+    ReconnectOnPlayerRemoving = true,
+    IgnorePlayerRemovingInMenu = true,
+    WatchExistingError = true,
+    IgnoredErrorPatterns = {},
+    Notify = false,
+}
+
+local RECONNECT_LABELS = {
+    ["reconnect"] = true,
+    ["rejoin"] = true,
+    ["retry"] = true,
+    ["yeniden bağlan"] = true,
+    ["yeniden baglan"] = true,
+    ["tekrar bağlan"] = true,
+    ["tekrar baglan"] = true,
+    ["tekrar katıl"] = true,
+    ["tekrar katil"] = true,
+    ["tekrar dene"] = true,
+    ["reconectar"] = true,
+    ["rejoindre"] = true,
+    ["erneut verbinden"] = true,
+}
+
+local function safeEnv()
+    if type(getgenv) == "function" then
+        local ok, genv = pcall(getgenv)
+        if ok and type(genv) == "table" then
+            return genv
+        end
+    end
+    return _G
 end
 
-local TeleportService = game:GetService("TeleportService")
-local Players = game:GetService("Players")
-local GuiService = game:GetService("GuiService")
-local CoreGui = game:GetService("CoreGui")
-local VirtualInputManager = game:GetService("VirtualInputManager")
+local env = safeEnv()
 
-local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
-local isRejoining = false
+local waitTask = (task and task.wait) or wait or function() end
+local spawnTask = (task and task.spawn) or function(fn, ...)
+    local co = coroutine.create(fn)
+    local ok, err = coroutine.resume(co, ...)
+    if not ok and warn then
+        warn("[Auto-Reconnect]", err)
+    end
+    return co
+end
+local cancelTask = (task and task.cancel) or function() end
 
--- 
-local function triggerReconnectButton()
+-- Temizlik: Script tekrar calistirilirsa onceki baglanti ve donguleri sonlandir
+local runId = (tonumber(env.__AutoReconnectRunId) or 0) + 1
+env.__AutoReconnectRunId = runId
+
+if type(env.__AutoReconnectState) == "table" and type(env.__AutoReconnectState.cleanup) == "function" then
+    pcall(env.__AutoReconnectState.cleanup)
+end
+
+local function isRunActive()
+    return env.__AutoReconnectRunId == runId
+end
+
+local function clockNow()
+    if os and type(os.clock) == "function" then
+        return os.clock()
+    end
+    return os and type(os.time) == "function" and os.time() or 0
+end
+
+local function clampMinNumber(value, defaultValue, minValue)
+    local num = tonumber(value)
+    if num == nil then
+        num = defaultValue
+    end
+    if num < minValue then
+        num = minValue
+    end
+    return num
+end
+
+local function resolveConfig()
+    local cfg = {}
+    for k, v in pairs(DEFAULT_SETTINGS) do
+        cfg[k] = v
+    end
+
+    local userSources = { _G and _G.AutoReconnectSettings, env.AutoReconnectSettings }
+    for _, src in ipairs(userSources) do
+        if type(src) == "table" then
+            for k, v in pairs(src) do
+                if DEFAULT_SETTINGS[k] ~= nil or k == "TargetPlaceId" or k == "FallbackPlaceId" then
+                    cfg[k] = v
+                end
+            end
+        end
+    end
+
+    cfg.MaxSameServerAttempts = math.floor(clampMinNumber(cfg.MaxSameServerAttempts, DEFAULT_SETTINGS.MaxSameServerAttempts, 1))
+    cfg.RetryDelay = clampMinNumber(cfg.RetryDelay, DEFAULT_SETTINGS.RetryDelay, 1)
+    cfg.FloodedDelay = clampMinNumber(cfg.FloodedDelay, DEFAULT_SETTINGS.FloodedDelay, cfg.RetryDelay)
+    cfg.PromptDelay = clampMinNumber(cfg.PromptDelay, DEFAULT_SETTINGS.PromptDelay, 0)
+    cfg.PlayerRemovingDelay = clampMinNumber(cfg.PlayerRemovingDelay, DEFAULT_SETTINGS.PlayerRemovingDelay, 0)
+
+    if type(cfg.IgnoredErrorPatterns) ~= "table" then
+        cfg.IgnoredErrorPatterns = {}
+    end
+
+    return cfg
+end
+
+local cfg = resolveConfig()
+
+local state = {
+    runId = runId,
+    active = true,
+    isRejoining = false,
+    sameServerAttempts = 0,
+    useFallbackPlace = false,
+    skipTeleportUntil = 0,
+    nextAttemptAt = 0,
+    ourTeleportUntil = 0,
+    externalTeleportUntil = 0,
+    loopThread = nil,
+    promptThread = nil,
+    connections = {},
+}
+
+function state.cleanup()
+    state.active = false
+    state.isRejoining = false
+
+    for i = #state.connections, 1, -1 do
+        local conn = state.connections[i]
+        state.connections[i] = nil
+        if conn then
+            pcall(function()
+                conn:Disconnect()
+            end)
+        end
+    end
+
+    if state.loopThread then
+        pcall(cancelTask, state.loopThread)
+        state.loopThread = nil
+    end
+    if state.promptThread then
+        pcall(cancelTask, state.promptThread)
+        state.promptThread = nil
+    end
+end
+
+env.__AutoReconnectState = state
+
+if not cfg.Enabled then
+    return
+end
+
+local function isActive()
+    return state.active and isRunActive()
+end
+
+local function trackConnection(signal, callback)
+    if not signal then
+        return nil
+    end
+    local ok, conn = pcall(function()
+        return signal:Connect(callback)
+    end)
+    if ok and conn then
+        table.insert(state.connections, conn)
+        return conn
+    end
+    return nil
+end
+
+local function safeCloneRef(instance)
+    if instance and type(cloneref) == "function" then
+        local ok, cloned = pcall(cloneref, instance)
+        if ok and cloned then
+            return cloned
+        end
+    end
+    return instance
+end
+
+local function safeGetService(serviceName)
+    local ok, svc = pcall(function()
+        return safeCloneRef(game:GetService(serviceName))
+    end)
+    if ok then
+        return svc
+    end
+    return nil
+end
+
+if game and type(game.IsLoaded) == "function" then
+    local okLoaded, loaded = pcall(function()
+        return game:IsLoaded()
+    end)
+    if okLoaded and not loaded and game.Loaded then
+        pcall(function()
+            game.Loaded:Wait()
+        end)
+    end
+end
+
+if not isActive() then
+    return
+end
+
+local Players = safeGetService("Players")
+local TeleportService = safeGetService("TeleportService")
+local GuiService = safeGetService("GuiService")
+local CoreGui = safeGetService("CoreGui")
+local VirtualInputManager = safeGetService("VirtualInputManager")
+local StarterGui = safeGetService("StarterGui")
+
+local LocalPlayer = Players and Players.LocalPlayer
+while Players and not LocalPlayer and isActive() do
+    waitTask(0.05)
+    LocalPlayer = Players.LocalPlayer
+end
+
+if not isActive() then
+    return
+end
+
+local getConnectionsFn = nil
+if type(getconnections) == "function" then
+    getConnectionsFn = getconnections
+elseif type(get_signal_cons) == "function" then
+    getConnectionsFn = get_signal_cons
+end
+
+local function notify(title, text)
+    if not cfg.Notify or not StarterGui then
+        return
+    end
     pcall(function()
-        local promptGui = CoreGui:FindFirstChild("RobloxPromptGui")
-        local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
-        local errorPrompt = overlay and overlay:FindFirstChild("ErrorPrompt")
-        if not errorPrompt then return end
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = 4,
+        })
+    end)
+end
+
+local function waitUntilNextAttempt()
+    while isActive() and state.isRejoining do
+        local remaining = (state.nextAttemptAt or 0) - clockNow()
+        if remaining <= 0 then
+            break
+        end
+        waitTask(remaining < 0.25 and remaining or 0.25)
+    end
+    state.nextAttemptAt = 0
+end
+
+local function trimLower(text)
+    if type(text) ~= "string" then
+        return ""
+    end
+    local trimmed = text:match("^%s*(.-)%s*$") or ""
+    return string.lower(trimmed)
+end
+
+local function getGuiErrorMessage()
+    if not GuiService then
+        return ""
+    end
+    local ok, msg = pcall(function()
+        return GuiService:GetErrorMessage()
+    end)
+    if ok and type(msg) == "string" then
+        return msg
+    end
+    return ""
+end
+
+local function getGuiErrorCode()
+    if not GuiService then
+        return nil
+    end
+    local ok, code = pcall(function()
+        return GuiService:GetErrorCode()
+    end)
+    if ok then
+        return code
+    end
+    return nil
+end
+
+local function matchesIgnoredPattern(text)
+    if type(text) ~= "string" or text == "" then
+        return false
+    end
+    local lowerText = string.lower(text)
+    for _, pat in ipairs(cfg.IgnoredErrorPatterns) do
+        if type(pat) == "string" and pat ~= "" then
+            if string.find(lowerText, string.lower(pat), 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function isReasonIgnored(reason)
+    if #cfg.IgnoredErrorPatterns == 0 then
+        return false
+    end
+    if matchesIgnoredPattern(reason) then
+        return true
+    end
+    local guiMsg = getGuiErrorMessage()
+    if matchesIgnoredPattern(guiMsg) then
+        return true
+    end
+    return false
+end
+
+local function isMenuOpen()
+    if not GuiService then
+        return false
+    end
+    local ok, open = pcall(function()
+        return GuiService.MenuIsOpen
+    end)
+    return ok and open == true
+end
+
+local function isExternalTeleportActive()
+    return clockNow() < state.externalTeleportUntil
+end
+
+local function isElementVisible(obj, stopAncestor)
+    local current = obj
+    while current and current ~= stopAncestor do
+        local okVis, visible = pcall(function()
+            return current.Visible
+        end)
+        if okVis and visible == false then
+            return false
+        end
+        current = current.Parent
+    end
+    local okSize, size = pcall(function()
+        return obj.AbsoluteSize
+    end)
+    if okSize and size and (size.X <= 0 or size.Y <= 0) then
+        return false
+    end
+    return true
+end
+
+local function isReconnectLabel(text)
+    local lower = trimLower(text)
+    if lower == "" then
+        return false
+    end
+    if RECONNECT_LABELS[lower] then
+        return true
+    end
+    return string.find(lower, "reconnect", 1, true) ~= nil
+        or string.find(lower, "yeniden bağlan", 1, true) ~= nil
+        or string.find(lower, "yeniden baglan", 1, true) ~= nil
+end
+
+local function isReconnectButton(obj, errorPrompt)
+    if not obj or not obj:IsA("GuiButton") then
+        return false
+    end
+    if not isElementVisible(obj, errorPrompt) then
+        return false
+    end
+
+    local lowerName = trimLower(obj.Name)
+    if string.find(lowerName, "leave", 1, true)
+        or string.find(lowerName, "close", 1, true)
+        or string.find(lowerName, "cancel", 1, true) then
+        return false
+    end
+
+    if lowerName == "reconnectbutton" or string.find(lowerName, "reconnect", 1, true) then
+        return true
+    end
+
+    -- Text ozelligi yalnizca TextButton uzerinde guvenle okunur (ImageButton hata firlatir)
+    if obj:IsA("TextButton") then
+        local okText, text = pcall(function()
+            return obj.Text
+        end)
+        if okText and isReconnectLabel(text) then
+            return true
+        end
+    end
+
+    for _, child in ipairs(obj:GetDescendants()) do
+        if child:IsA("TextLabel") then
+            local okText, text = pcall(function()
+                return child.Text
+            end)
+            if okText and isReconnectLabel(text) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function fireGuiSignals(button)
+    local signals = { "MouseButton1Click", "Activated" }
+    for _, sigName in ipairs(signals) do
+        local okSig, sig = pcall(function()
+            return button[sigName]
+        end)
+        if okSig and sig then
+            if type(firesignal) == "function" then
+                pcall(firesignal, sig)
+            elseif getConnectionsFn then
+                local okConns, conns = pcall(getConnectionsFn, sig)
+                if okConns and type(conns) == "table" then
+                    for _, conn in ipairs(conns) do
+                        pcall(function()
+                            if type(conn.Fire) == "function" then
+                                conn:Fire()
+                            elseif type(conn.Function) == "function" then
+                                conn.Function()
+                            end
+                        end)
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function clickButtonWithVIM(button, promptGui)
+    if not VirtualInputManager then
+        return
+    end
+    pcall(function()
+        local pos = button.AbsolutePosition
+        local size = button.AbsoluteSize
+        if not pos or not size then
+            return
+        end
+
+        local x = pos.X + (size.X * 0.5)
+        local y = pos.Y + (size.Y * 0.5)
+
+        -- IgnoreGuiInset == true ise AbsolutePosition zaten pencere ustunden baslar; aksi halde topbar inset eklenir
+        local ignoreInset = false
+        if promptGui then
+            local okInset, value = pcall(function()
+                return promptGui.IgnoreGuiInset
+            end)
+            if okInset and value == true then
+                ignoreInset = true
+            end
+        end
+
+        if not ignoreInset and GuiService then
+            local okGuiInset, topLeftInset = pcall(function()
+                return GuiService:GetGuiInset()
+            end)
+            if okGuiInset and topLeftInset then
+                x = x + topLeftInset.X
+                y = y + topLeftInset.Y
+            end
+        end
+
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        waitTask(0.05)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+end
+
+local function findPromptGuiAndOverlay()
+    if not CoreGui then
+        return nil, nil
+    end
+    local ok, promptGui, overlay = pcall(function()
+        local pg = CoreGui:FindFirstChild("RobloxPromptGui")
+        local ov = pg and pg:FindFirstChild("promptOverlay")
+        return pg, ov
+    end)
+    if ok then
+        return promptGui, overlay
+    end
+    return nil, nil
+end
+
+local function findVisibleErrorPrompt(overlay)
+    if not overlay then
+        return nil
+    end
+    local ok, prompt = pcall(function()
+        local direct = overlay:FindFirstChild("ErrorPrompt")
+        if direct then
+            return direct
+        end
+        for _, child in ipairs(overlay:GetChildren()) do
+            if child:FindFirstChild("ButtonArea", true) then
+                return child
+            end
+        end
+        return nil
+    end)
+    if ok then
+        return prompt
+    end
+    return nil
+end
+
+local function triggerReconnectButton()
+    local triggered = false
+    pcall(function()
+        local promptGui, overlay = findPromptGuiAndOverlay()
+        local errorPrompt = findVisibleErrorPrompt(overlay)
+        if not errorPrompt or not isElementVisible(errorPrompt, overlay) then
+            return
+        end
 
         for _, obj in ipairs(errorPrompt:GetDescendants()) do
-            if obj:IsA("GuiButton") and (obj.Name == "ReconnectButton" or obj.Text == "Reconnect") then
-                -- 1. 
-                if firesignal then
-                    pcall(firesignal, obj.MouseButton1Click)
-                    pcall(firesignal, obj.Activated)
-                end
-
-                -- 2. 
-                local inset = GuiService:GetGuiInset()
-                local pos = obj.AbsolutePosition
-                local size = obj.AbsoluteSize
-                local x = pos.X + (size.X / 2)
-                local y = pos.Y + (size.Y / 2) + inset.Y
-
-                VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
-                task.wait(0.05)
-                VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            if isReconnectButton(obj, errorPrompt) then
+                fireGuiSignals(obj)
+                clickButtonWithVIM(obj, promptGui)
+                triggered = true
                 break
             end
         end
     end)
+    return triggered
+end
+
+local function resolveTargetPlaceId()
+    local fallbackId = tonumber(cfg.FallbackPlaceId)
+    if state.useFallbackPlace and fallbackId and fallbackId > 0 then
+        return fallbackId
+    end
+    local targetId = tonumber(cfg.TargetPlaceId)
+    if targetId and targetId > 0 then
+        return targetId
+    end
+    return game and game.PlaceId or 0
+end
+
+local function performTeleport()
+    if not TeleportService or not LocalPlayer then
+        return false
+    end
+
+    local placeId = resolveTargetPlaceId()
+    if not placeId or placeId <= 0 then
+        return false
+    end
+
+    state.ourTeleportUntil = clockNow() + 15
+
+    local jobId = game and game.JobId
+    local canTrySameServer = cfg.PreferSameServer
+        and not state.useFallbackPlace
+        and type(jobId) == "string"
+        and jobId ~= ""
+        and state.sameServerAttempts < cfg.MaxSameServerAttempts
+
+    if canTrySameServer then
+        state.sameServerAttempts = state.sameServerAttempts + 1
+        local okSame = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+        end)
+        if okSame then
+            return true
+        end
+    end
+
+    local okTeleport = pcall(function()
+        TeleportService:Teleport(placeId, LocalPlayer)
+    end)
+    return okTeleport
 end
 
 local function attemptRejoin(reason)
-    if isRejoining then return end
-    isRejoining = true
-
-    warn("[Auto-Rejoin] Tetiklendi ->", reason or "Bilinmeyen sebep")
-
-    while true do
-        -- 
-        triggerReconnectButton()
-
-        -- 
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, LocalPlayer)
-        end)
-
-        task.wait(5)
+    if not isActive() or state.isRejoining then
+        return
     end
+    if isReasonIgnored(reason) then
+        return
+    end
+
+    state.isRejoining = true
+
+    if warn then
+        warn("[Auto-Rejoin] Tetiklendi ->", reason or "Bilinmeyen sebep")
+    end
+    notify("Auto-Reconnect", "Yeniden baglaniliyor: " .. tostring(reason or "Bilinmeyen sebep"))
+
+    state.loopThread = spawnTask(function()
+        while isActive() and state.isRejoining do
+            if cfg.ClickReconnectButton then
+                triggerReconnectButton()
+            end
+
+            if not isActive() or not state.isRejoining then
+                break
+            end
+
+            if clockNow() >= state.skipTeleportUntil then
+                performTeleport()
+            end
+
+            state.nextAttemptAt = math.max(state.nextAttemptAt or 0, clockNow() + cfg.RetryDelay)
+            waitUntilNextAttempt()
+        end
+    end)
 end
 
--- 1. When error message changed
-GuiService.ErrorMessageChanged:Connect(function()
-    local msg = GuiService:GetErrorMessage()
-    if msg and msg ~= "" then
-        attemptRejoin("GuiService: " .. msg)
+local function checkGuiServiceError(sourceTag)
+    local msg = getGuiErrorMessage()
+    if msg ~= "" then
+        attemptRejoin((sourceTag or "GuiService") .. ": " .. msg)
+        return true
     end
-end)
 
--- 2. ErrorPrompt 
-task.spawn(function()
-    local ok, promptGui = pcall(function()
-        return CoreGui:WaitForChild("RobloxPromptGui", 10)
-    end)
-    local overlay = ok and promptGui and promptGui:WaitForChild("promptOverlay", 10)
-    if overlay then
-        if overlay:FindFirstChild("ErrorPrompt") then
-            attemptRejoin("Existing ErrorPrompt detected")
+    local code = getGuiErrorCode()
+    if code ~= nil and Enum and Enum.ConnectionError and code ~= Enum.ConnectionError.OK then
+        attemptRejoin((sourceTag or "ConnectionError") .. ": " .. tostring(code))
+        return true
+    end
+
+    return false
+end
+
+-- Teleport durum takibi: oyunun kendi sunucu gecislerini kacirmamak ve hata kodlarina gore yedeklemek icin
+if LocalPlayer and LocalPlayer.OnTeleport then
+    trackConnection(LocalPlayer.OnTeleport, function(teleportState)
+        if not isActive() or not Enum or not Enum.TeleportState then
+            return
         end
-        overlay.ChildAdded:Connect(function(child)
-            if child.Name == "ErrorPrompt" then
-                task.wait(0.2) -- 
-                attemptRejoin("ErrorPrompt opened")
+        local isOurTeleport = clockNow() < state.ourTeleportUntil
+        if teleportState == Enum.TeleportState.Started
+            or teleportState == Enum.TeleportState.WaitingForServer
+            or teleportState == Enum.TeleportState.InProgress then
+            if not isOurTeleport then
+                state.externalTeleportUntil = clockNow() + 30
+            end
+        elseif teleportState == Enum.TeleportState.Failed then
+            state.externalTeleportUntil = 0
+        end
+    end)
+end
+
+if TeleportService and TeleportService.TeleportInitFailed then
+    trackConnection(TeleportService.TeleportInitFailed, function(player, teleportResult)
+        if not isActive() or player ~= LocalPlayer or not state.isRejoining then
+            return
+        end
+        if not Enum or not Enum.TeleportResult then
+            return
+        end
+
+        if teleportResult == Enum.TeleportResult.IsTeleporting then
+            state.skipTeleportUntil = clockNow() + cfg.RetryDelay + 0.5
+            state.nextAttemptAt = math.max(state.nextAttemptAt or 0, clockNow() + cfg.RetryDelay)
+        elseif teleportResult == Enum.TeleportResult.Flooded then
+            state.nextAttemptAt = math.max(state.nextAttemptAt or 0, clockNow() + cfg.FloodedDelay)
+        elseif teleportResult == Enum.TeleportResult.GameFull
+            or teleportResult == Enum.TeleportResult.GameEnded
+            or teleportResult == Enum.TeleportResult.Failure
+            or teleportResult == Enum.TeleportResult.Unauthorized
+            or teleportResult == Enum.TeleportResult.GameNotFound then
+            state.sameServerAttempts = cfg.MaxSameServerAttempts
+
+            if (teleportResult == Enum.TeleportResult.Unauthorized
+                or teleportResult == Enum.TeleportResult.GameEnded
+                or teleportResult == Enum.TeleportResult.GameNotFound) then
+                local fallbackId = tonumber(cfg.FallbackPlaceId)
+                if fallbackId and fallbackId > 0 then
+                    state.useFallbackPlace = true
+                end
+            end
+        end
+    end)
+end
+
+-- 1. GuiService hata mesaji ve UI mesaj olaylari
+if cfg.ReconnectOnErrorMessage and GuiService then
+    trackConnection(GuiService.ErrorMessageChanged, function()
+        if isActive() then
+            checkGuiServiceError("GuiService")
+        end
+    end)
+
+    if GuiService.UiMessageChanged then
+        trackConnection(GuiService.UiMessageChanged, function(msgType, newMessage)
+            if not isActive() then
+                return
+            end
+            local isUiError = Enum and Enum.UiMessageType and msgType == Enum.UiMessageType.UiMessageError
+            if isUiError and type(newMessage) == "string" and newMessage ~= "" then
+                attemptRejoin("UiMessage: " .. newMessage)
+            else
+                checkGuiServiceError("UiMessage")
             end
         end)
     end
-end)
 
--- 3. Oyuncu sunucudan düşürüldüğünde
-Players.PlayerRemoving:Connect(function(player)
-    if player == LocalPlayer then
-        attemptRejoin("PlayerRemoving tetiklendi")
+    if cfg.WatchExistingError then
+        checkGuiServiceError("Existing Error")
     end
-end)
+end
+
+-- 2. RobloxPromptGui / ErrorPrompt gozlemcisi (gecikmeli yukleme destekli)
+if cfg.ReconnectOnErrorPrompt and CoreGui then
+    local attachedOverlays = {}
+
+    local function attachOverlayWatcher(overlay)
+        if not overlay or attachedOverlays[overlay] then
+            return
+        end
+        attachedOverlays[overlay] = true
+
+        if cfg.WatchExistingError and findVisibleErrorPrompt(overlay) then
+            attemptRejoin("Existing ErrorPrompt detected")
+        end
+
+        local function isErrorPromptChild(child)
+            if not child then
+                return false
+            end
+            if child.Name == "ErrorPrompt" then
+                return true
+            end
+            local ok, buttonArea = pcall(function()
+                return child:FindFirstChild("ButtonArea", true)
+            end)
+            return ok and buttonArea ~= nil
+        end
+
+        trackConnection(overlay.ChildAdded, function(child)
+            if not isActive() then
+                return
+            end
+            if isErrorPromptChild(child) then
+                if cfg.PromptDelay > 0 then
+                    waitTask(cfg.PromptDelay)
+                end
+                if isActive() and child.Parent == overlay then
+                    attemptRejoin("ErrorPrompt opened")
+                end
+            end
+        end)
+    end
+
+    local function tryBindPromptGui()
+        local _, overlay = findPromptGuiAndOverlay()
+        if overlay then
+            attachOverlayWatcher(overlay)
+            return true
+        end
+        return false
+    end
+
+    pcall(function()
+        trackConnection(CoreGui.ChildAdded, function(child)
+            if isActive() and child and child.Name == "RobloxPromptGui" then
+                waitTask(0.1)
+                if isActive() then
+                    tryBindPromptGui()
+                end
+            end
+        end)
+    end)
+
+    state.promptThread = spawnTask(function()
+        local elapsed = 0
+        while isActive() and elapsed < 60 do
+            if tryBindPromptGui() then
+                break
+            end
+            waitTask(0.5)
+            elapsed = elapsed + 0.5
+        end
+        state.promptThread = nil
+    end)
+end
+
+-- 3. Oyuncu sunucudan dusuruldugunde (oyun ici teleport ve manuel cikis korumali)
+if cfg.ReconnectOnPlayerRemoving and Players and LocalPlayer then
+    trackConnection(Players.PlayerRemoving, function(player)
+        if not isActive() or player ~= LocalPlayer or state.isRejoining then
+            return
+        end
+
+        spawnTask(function()
+            if cfg.PlayerRemovingDelay > 0 then
+                waitTask(cfg.PlayerRemovingDelay)
+            end
+            if not isActive() or state.isRejoining then
+                return
+            end
+            if checkGuiServiceError("PlayerRemoving Error") then
+                return
+            end
+            if isExternalTeleportActive() then
+                return
+            end
+            if cfg.IgnorePlayerRemovingInMenu and isMenuOpen() then
+                return
+            end
+            attemptRejoin("PlayerRemoving tetiklendi")
+        end)
+    end)
+end
+
+print("[Auto-Reconnect] Universal Auto-Reconnect basariyla yuklendi!")
