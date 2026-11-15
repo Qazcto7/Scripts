@@ -6,32 +6,37 @@ local Players = game:GetService("Players")
 local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
--- Script tekrar çalıştırılırsa eski bağlantıyı temizle
 local env = (getgenv and getgenv()) or _G
+local runId = os.clock()
+env.AntiAFKRunId = runId
+
 if env.AntiAFKConnection then
     env.AntiAFKConnection:Disconnect()
     env.AntiAFKConnection = nil
 end
 
--- 1. Yöntem: Roblox'un kendi AFK atma bağlantısını doğrudan devre dışı bırak (Sıfır yan etki)
-local disabledNative = false
-if getconnections then
+local function simulateActivity()
     pcall(function()
-        for _, conn in ipairs(getconnections(LocalPlayer.Idled)) do
-            if conn.Disable then
-                conn:Disable()
-                disabledNative = true
-            end
-        end
+        local cam = workspace.CurrentCamera
+        local cf = cam and cam.CFrame or CFrame.new()
+        VirtualUser:CaptureController()
+        VirtualUser:Button2Down(Vector2.new(0, 0), cf)
+        task.wait(0.1)
+        VirtualUser:Button2Up(Vector2.new(0, 0), cf)
     end)
 end
 
--- 2. Yöntem (Yedek): getconnections desteklenmiyorsa VirtualUser kullan
-if not disabledNative then
-    env.AntiAFKConnection = LocalPlayer.Idled:Connect(function()
-        pcall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new())
-        end)
-    end)
-end
+-- 1. 
+env.AntiAFKConnection = LocalPlayer.Idled:Connect(simulateActivity)
+
+-- 2. 
+task.spawn(function()
+    while env.AntiAFKRunId == runId and LocalPlayer.Parent do
+        task.wait(720) --
+        if env.AntiAFKRunId == runId and LocalPlayer.Parent then
+            simulateActivity()
+        end
+    end
+end)
+
+
