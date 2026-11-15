@@ -160,3 +160,6 @@ local function optimizeInstance(inst)
         local ex = cfg.Explosions
         if ex.Destroy then
             -- ... remaining branch not included in the provided snippet; unchanged
+
+
+print("Optimizer script successfuly loaded!")
