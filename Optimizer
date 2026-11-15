@@ -413,23 +413,7 @@ local function handleMeshPart(inst)
     end
 end
 
-local function handlePartOperation(inst)
-    if lowQualityParts then
-        if SMOOTH_PLASTIC and inst.Material ~= SMOOTH_PLASTIC then
-            inst.Material = SMOOTH_PLASTIC
-        end
-        if inst.Reflectance ~= 0 then
-            inst.Reflectance = 0
-        end
-        if PERF_FIDELITY and inst.RenderFidelity ~= PERF_FIDELITY then
-            pcall(setPropSafe, inst, "RenderFidelity", PERF_FIDELITY)
-        end
-    end
-    if noShadows and inst.CastShadow then
-        inst.CastShadow = false
-    end
-end
-
+-- Note: PartOperation/SolidModel RenderFidelity is skipped at runtime because Roblox logs "Cannot change SolidModel RenderFidelity during Run-Time" even under pcall.
 local function handleBasePart(inst)
     if lowQualityParts then
         if SMOOTH_PLASTIC and inst.Material ~= SMOOTH_PLASTIC then
@@ -539,9 +523,10 @@ end
 local CLASS_HANDLERS = {
     MeshPart = handleMeshPart,
 
-    UnionOperation = handlePartOperation,
-    IntersectOperation = handlePartOperation,
-    NegateOperation = handlePartOperation,
+    PartOperation = handleBasePart,
+    UnionOperation = handleBasePart,
+    IntersectOperation = handleBasePart,
+    NegateOperation = handleBasePart,
 
     Part = handleBasePart,
     WedgePart = handleBasePart,
@@ -674,9 +659,6 @@ local function resolveHandler(inst, className)
     elseif inst:IsA("MeshPart") then
         CLASS_HANDLERS[className] = handleMeshPart
         return handleMeshPart
-    elseif inst:IsA("PartOperation") then
-        CLASS_HANDLERS[className] = handlePartOperation
-        return handlePartOperation
     elseif inst:IsA("BasePart") then
         CLASS_HANDLERS[className] = handleBasePart
         return handleBasePart

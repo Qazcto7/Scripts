@@ -57,7 +57,7 @@ local spawnTask = (task and task.spawn) or function(fn, ...)
 end
 local cancelTask = (task and task.cancel) or function() end
 
--- Temizlik: Script tekrar calistirilirsa onceki baglanti ve donguleri sonlandir
+-- Cleanup: tear down connections and loops from any previous execution
 local runId = (tonumber(env.__AutoReconnectRunId) or 0) + 1
 env.__AutoReconnectRunId = runId
 
@@ -394,7 +394,7 @@ local function isReconnectButton(obj, errorPrompt)
         return true
     end
 
-    -- Text ozelligi yalnizca TextButton uzerinde guvenle okunur (ImageButton hata firlatir)
+    -- Only read .Text on TextButton (accessing .Text on ImageButton throws an error)
     if obj:IsA("TextButton") then
         local okText, text = pcall(function()
             return obj.Text
@@ -459,7 +459,7 @@ local function clickButtonWithVIM(button, promptGui)
         local x = pos.X + (size.X * 0.5)
         local y = pos.Y + (size.Y * 0.5)
 
-        -- IgnoreGuiInset == true ise AbsolutePosition zaten pencere ustunden baslar; aksi halde topbar inset eklenir
+        -- When IgnoreGuiInset == true, AbsolutePosition already starts at screen top; otherwise add topbar inset
         local ignoreInset = false
         if promptGui then
             local okInset, value = pcall(function()
@@ -602,9 +602,9 @@ local function attemptRejoin(reason)
     state.isRejoining = true
 
     if warn then
-        warn("[Auto-Rejoin] Tetiklendi ->", reason or "Bilinmeyen sebep")
+        warn("[Auto-Reconnect] Triggered ->", reason or "Unknown reason")
     end
-    notify("Auto-Reconnect", "Yeniden baglaniliyor: " .. tostring(reason or "Bilinmeyen sebep"))
+    notify("Auto-Reconnect", "Reconnecting: " .. tostring(reason or "Unknown reason"))
 
     state.loopThread = spawnTask(function()
         while isActive() and state.isRejoining do
@@ -642,7 +642,7 @@ local function checkGuiServiceError(sourceTag)
     return false
 end
 
--- Teleport durum takibi: oyunun kendi sunucu gecislerini kacirmamak ve hata kodlarina gore yedeklemek icin
+-- Teleport state tracking: avoid interrupting game-initiated teleports and recover from failure results
 if LocalPlayer and LocalPlayer.OnTeleport then
     trackConnection(LocalPlayer.OnTeleport, function(teleportState)
         if not isActive() or not Enum or not Enum.TeleportState then
@@ -694,7 +694,7 @@ if TeleportService and TeleportService.TeleportInitFailed then
     end)
 end
 
--- 1. GuiService hata mesaji ve UI mesaj olaylari
+-- 1. GuiService error message and UI message events
 if cfg.ReconnectOnErrorMessage and GuiService then
     trackConnection(GuiService.ErrorMessageChanged, function()
         if isActive() then
@@ -721,7 +721,7 @@ if cfg.ReconnectOnErrorMessage and GuiService then
     end
 end
 
--- 2. RobloxPromptGui / ErrorPrompt gozlemcisi (gecikmeli yukleme destekli)
+-- 2. RobloxPromptGui / ErrorPrompt watcher (supports delayed creation)
 if cfg.ReconnectOnErrorPrompt and CoreGui then
     local attachedOverlays = {}
 
@@ -796,7 +796,7 @@ if cfg.ReconnectOnErrorPrompt and CoreGui then
     end)
 end
 
--- 3. Oyuncu sunucudan dusuruldugunde (oyun ici teleport ve manuel cikis korumali)
+-- 3. PlayerRemoving fallback (guarded against game teleports and manual menu exits)
 if cfg.ReconnectOnPlayerRemoving and Players and LocalPlayer then
     trackConnection(Players.PlayerRemoving, function(player)
         if not isActive() or player ~= LocalPlayer or state.isRejoining then
@@ -819,9 +819,9 @@ if cfg.ReconnectOnPlayerRemoving and Players and LocalPlayer then
             if cfg.IgnorePlayerRemovingInMenu and isMenuOpen() then
                 return
             end
-            attemptRejoin("PlayerRemoving tetiklendi")
+            attemptRejoin("PlayerRemoving triggered")
         end)
     end)
 end
 
-print("[Auto-Reconnect] Universal Auto-Reconnect basariyla yuklendi!")
+print("[Auto-Reconnect] Universal Auto-Reconnect successfully loaded!")
