@@ -1,131 +1,162 @@
--- Combined Universal Anti-Lag Script (No Toggle, No Default Restoration, Fonts Untouched)
-
--- User Settings
-if not _G.Settings then
-    _G.Settings = {
-        Players = {
-            ["Ignore Me"] = true,
-            ["Ignore Others"] = true
-        },
-        Meshes = {
-            Destroy = false,
-            LowDetail = true
-        },
-        Images = {
-            Invisible = true,
-            Destroy = false
-        },
-        Explosions = {
-            Smaller = true,
-            Invisible = false,
-            Destroy = false
-        },
-        Particles = {
-            Invisible = true,
-            Destroy = false
-        },
-        TextLabels = {
-            LowerQuality = true,
-            Invisible = false,
-            Destroy = false
-        },
-        MeshParts = {
-            LowerQuality = true,
-            Invisible = false,
-            Destroy = false
-        },
-        Other = {
-            ["No Particles"] = true,
-            ["No Camera Effects"] = true,
-            ["No Explosions"] = true,
-            ["No Clothes"] = true,
-            ["Low Water Graphics"] = true,
-            ["No Shadows"] = true,
-            ["Low Rendering"] = true,
-            ["Low Quality Parts"] = true
-        }
-    }
+if not game:IsLoaded() then
+    game.Loaded:Wait()
 end
 
--- Services
+local function mergeDefaults(defaults, overrides)
+    overrides = overrides or {}
+    local result = {}
+    for key, default in pairs(defaults) do
+        local override = overrides[key]
+        if type(default) == "table" then
+            result[key] = mergeDefaults(default, type(override) == "table" and override or nil)
+        elseif override ~= nil then
+            result[key] = override
+        else
+            result[key] = default
+        end
+    end
+    return result
+end
+
+local DEFAULT_SETTINGS = {
+    Players = {
+        ["Ignore Me"] = true,
+        ["Ignore Others"] = true
+    },
+    Meshes = {
+        Destroy = false,
+        LowDetail = true
+    },
+    Images = {
+        Invisible = true,
+        Destroy = false
+    },
+    Explosions = {
+        Smaller = true,
+        Invisible = false,
+        Destroy = false
+    },
+    Particles = {
+        Invisible = true,
+        Destroy = false
+    },
+    MeshParts = {
+        LowerQuality = true,
+        Invisible = false,
+        Destroy = false
+    },
+    Other = {
+        ["No Camera Effects"] = true,
+        ["No Clothes"] = true,
+        ["Low Water Graphics"] = true,
+        ["No Shadows"] = true,
+        ["Low Rendering"] = true,
+        ["Low Quality Parts"] = true
+    }
+}
+
+_G.Settings = mergeDefaults(DEFAULT_SETTINGS, _G.Settings)
+
 local Players = game:GetService("Players")
 local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
-local MaterialService = game:GetService("MaterialService")
-local StarterGui = game:GetService("StarterGui")
-local LocalPlayer = Players.LocalPlayer
-local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer -- Must run as a LocalScript
 
--- Configurations
-local renderDistanceAFK = 100 -- Max render distance in AFK mode
-local cleanupInterval = 300 -- Cleanup interval (seconds)
-local isAFK = true -- Enable optimizations by default
-local decalsYeeted = true -- Removes decals for performance boost
+local cfg = _G.Settings
+local IgnoredCharacters = {}
 
--- Optimization Function
-local function optimizeRendering()
-    print("[Optimization]: Reducing visual load...")
-
-    -- Terrain Optimizations
-    local terrain = Workspace:FindFirstChildOfClass("Terrain")
-    if terrain then
-        terrain.WaterWaveSize = 0
-        terrain.WaterWaveSpeed = 0
-        terrain.WaterReflectance = 0
-        terrain.WaterTransparency = 0
-    end
-
-    -- Lighting Optimizations
-    Lighting.GlobalShadows = false
-    Lighting.FogEnd = 9e9
-    Lighting.Brightness = 0
-    for _, effect in pairs(Lighting:GetChildren()) do
-        if effect:IsA("BlurEffect") or effect:IsA("SunRaysEffect") or effect:IsA("ColorCorrectionEffect") 
-            or effect:IsA("BloomEffect") or effect:IsA("DepthOfFieldEffect") then
-            effect.Enabled = false
-        end
-    end
-
-    -- Object Optimizations (Keep Character Visible)
-    for _, instance in pairs(game:GetDescendants()) do
-        if instance:IsA("BasePart") and instance.Parent ~= LocalPlayer.Character then
-            instance.Material = Enum.Material.Plastic
-            instance.Reflectance = 0
-        elseif instance:IsA("Decal") or instance:IsA("Texture") then
-            instance.Transparency = decalsYeeted and 1 or 0
-        elseif instance:IsA("ParticleEmitter") or instance:IsA("Trail") then
-            instance.Enabled = false
-        elseif instance:IsA("Explosion") then
-            instance.BlastPressure = 1
-            instance.BlastRadius = 1
-        elseif instance:IsA("MeshPart") then
-            instance.Material = Enum.Material.Plastic
-            instance.Reflectance = 0
-            instance.TextureID = ""
-        elseif instance:IsA("TextLabel") then
-            -- Do nothing to retain original font, size, and properties
-        end
-    end
-
-    -- Rendering Settings
-    settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-    print("[Optimization]: Visuals minimized!")
+local function updateCharacterCache(player, char)
+    if not char then return end
+    local ignore = (player == LocalPlayer and cfg.Players["Ignore Me"])
+        or (player ~= LocalPlayer and cfg.Players["Ignore Others"])
+    IgnoredCharacters[char] = ignore or nil
 end
 
--- Periodic Cleanup
-RunService.Heartbeat:Connect(function()
-    if isAFK and tick() % cleanupInterval < 0.03 then
-        print("[Optimization]: Cleaning up unused objects...")
-        for _, instance in pairs(Workspace:GetDescendants()) do
-            if instance:IsA("BasePart") and not instance.Anchored then
-                instance:Destroy()
-            end
-        end
-        collectgarbage()
-    end
-end)
-
--- Initial Execution
-if isAFK then
-    optimizeRendering()
+local function hookPlayer(player)
+    player.CharacterAdded:Connect(function(char)
+        updateCharacterCache(player, char)
+    end)
+    player.CharacterRemoving:Connect(function(char)
+        IgnoredCharacters[char] = nil
+    end)
 end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    hookPlayer(p)
+    updateCharacterCache(p, p.Character)
+end
+Players.PlayerAdded:Connect(hookPlayer)
+
+local function isIgnored(inst)
+    if inst:IsDescendantOf(Players) then return true end
+
+    local node = inst
+    while node do
+        if IgnoredCharacters[node] then
+            return true
+        end
+        node = node.Parent
+    end
+    return false
+end
+
+local function optimizeInstance(inst)
+    if isIgnored(inst) then return end
+
+    -- MeshPart inherits from BasePart, so it must be checked first
+    if inst:IsA("MeshPart") then
+        local mp = cfg.MeshParts
+        if mp.Destroy then
+            inst:Destroy()
+            return
+        end
+        if mp.Invisible then
+            inst.Transparency = 1
+        end
+        if mp.LowerQuality then
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.Reflectance = 0
+            inst.TextureID = ""
+            pcall(function()
+                inst.RenderFidelity = Enum.RenderFidelity.Performance
+            end)
+        end
+        if cfg.Other["No Shadows"] then
+            inst.CastShadow = false
+        end
+
+    elseif inst:IsA("BasePart") then
+        if cfg.Other["Low Quality Parts"] then
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.Reflectance = 0
+        end
+        if cfg.Other["No Shadows"] then
+            inst.CastShadow = false
+        end
+
+    elseif inst:IsA("DataModelMesh") then
+        if cfg.Meshes.Destroy then
+            inst:Destroy()
+        elseif cfg.Meshes.LowDetail and sethiddenproperty then
+            pcall(sethiddenproperty, inst, "LODX", Enum.LevelOfDetailSetting.Low)
+            pcall(sethiddenproperty, inst, "LODY", Enum.LevelOfDetailSetting.Low)
+        end
+
+    elseif inst:IsA("Decal") or inst:IsA("Texture") then
+        if cfg.Images.Destroy then
+            inst:Destroy()
+        elseif cfg.Images.Invisible then
+            inst.Transparency = 1
+        end
+
+    elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Smoke") or inst:IsA("Fire") or inst:IsA("Sparkles") then
+        if cfg.Particles.Destroy then
+            inst:Destroy()
+        elseif cfg.Particles.Invisible then
+            inst.Enabled = false
+        end
+
+    elseif inst:IsA("Explosion") then
+        local ex = cfg.Explosions
+        if ex.Destroy then
+            -- ... remaining branch not included in the provided snippet; unchanged
