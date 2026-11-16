@@ -2,8 +2,36 @@ local filename = "LS.txt"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local waitTask = (type(task) == "table" and type(task.wait) == "function" and task.wait) or wait
-local spawnTask = (type(task) == "table" and type(task.spawn) == "function" and task.spawn) or spawn
+
+local function safeWait(sec)
+    if type(task) == "table" and type(task.wait) == "function" then
+        if sec ~= nil then
+            task.wait(sec)
+        else
+            task.wait()
+        end
+        return
+    end
+    if type(wait) == "function" then
+        if sec ~= nil then
+            wait(sec)
+        else
+            wait()
+        end
+    end
+end
+
+local function safeSpawn(fn)
+    if type(task) == "table" and type(task.spawn) == "function" then
+        return task.spawn(fn)
+    end
+    if type(spawn) == "function" then
+        return spawn(fn)
+    end
+    local co = coroutine.create(fn)
+    coroutine.resume(co)
+    return co
+end
 
 -- Initialize settings table with default values
 local settingsTable = {
@@ -93,93 +121,120 @@ local function getRemoteEvent()
     if remoteEvent and remoteEvent.Parent then
         return remoteEvent
     end
-    remoteEvent = ReplicatedStorage:FindFirstChild("RemoteEvent") or ReplicatedStorage:WaitForChild("RemoteEvent", 5)
-    return remoteEvent
+    local okFind, found = pcall(function()
+        return ReplicatedStorage:FindFirstChild("RemoteEvent") or ReplicatedStorage:WaitForChild("RemoteEvent", 2)
+    end)
+    if okFind and found then
+        remoteEvent = found
+        return remoteEvent
+    end
+    local okDirect, direct = pcall(function()
+        return ReplicatedStorage.RemoteEvent
+    end)
+    if okDirect and direct then
+        remoteEvent = direct
+        return remoteEvent
+    end
+    return nil
 end
 
 -- Toggle for Auto Lift
-w:Toggle('Auto Lift', {flag = "AutoLift", default = settingsTable.AutoLift}, function(state)
+w:Toggle('Auto Lift', {flag = "AutoLift", default = settingsTable.AutoLift == true}, function(state)
     settingsTable.AutoLift = state
     saveSettings()
 end)
 
-spawnTask(function()
-    while waitTask() do
+safeSpawn(function()
+    while true do
         if w.flags.AutoLift then
             local ev = getRemoteEvent()
             if ev then
-                for _ = 1, 5 do
-                    ev:FireServer({"GainMuscle"})
-                end
+                pcall(function()
+                    for _ = 1, 5 do
+                        ev:FireServer({"GainMuscle"})
+                    end
+                end)
             end
         end
+        safeWait()
     end
 end)
 
 -- Toggle for Auto Lift x100
-w:Toggle('Auto Lift x100', {flag = "AutoLift1", default = settingsTable.AutoLift1}, function(state)
+w:Toggle('Auto Lift x100', {flag = "AutoLift1", default = settingsTable.AutoLift1 == true}, function(state)
     settingsTable.AutoLift1 = state
     saveSettings()
 end)
 
-spawnTask(function()
-    while waitTask() do
+safeSpawn(function()
+    while true do
         if w.flags.AutoLift1 then
             local ev = getRemoteEvent()
             if ev then
-                for _ = 1, 100 do
-                    ev:FireServer({"GainMuscle"})
-                end
+                pcall(function()
+                    for _ = 1, 100 do
+                        ev:FireServer({"GainMuscle"})
+                    end
+                end)
             end
-            waitTask(0.3)
+            safeWait(0.3)
+        else
+            safeWait()
         end
     end
 end)
 
 -- Toggle for Auto Sell
-w:Toggle('Auto Sell', {flag = "AutoSell", default = settingsTable.AutoSell}, function(state)
+w:Toggle('Auto Sell', {flag = "AutoSell", default = settingsTable.AutoSell == true}, function(state)
     settingsTable.AutoSell = state
     saveSettings()
 end)
 
-spawnTask(function()
-    while waitTask() do
+safeSpawn(function()
+    while true do
         if w.flags.AutoSell then
             local ev = getRemoteEvent()
             if ev then
-                ev:FireServer({"SellMuscle"})
+                pcall(function()
+                    ev:FireServer({"SellMuscle"})
+                end)
             end
         end
+        safeWait()
     end
 end)
 
 -- Function to automatically equip the first tool in the backpack and activate it for farming
 local function equipAndFarm()
     local player = Players.LocalPlayer
-    while waitTask() do
-        if player and player.Character then
-            local toolEquipped = player.Character:FindFirstChildOfClass("Tool")
-            if not toolEquipped then
-                local backpack = player:FindFirstChildOfClass("Backpack") or player.Backpack
-                if backpack then
-                    for _, item in ipairs(backpack:GetChildren()) do
-                        if item:IsA("Tool") then
-                            item.Parent = player.Character
-                            break
+    while true do
+        safeWait()
+        pcall(function()
+            player = player or Players.LocalPlayer
+            if player and player.Character then
+                local toolEquipped = player.Character:FindFirstChildOfClass("Tool")
+                if not toolEquipped then
+                    local backpack = player:FindFirstChildOfClass("Backpack") or player.Backpack
+                    if backpack then
+                        for _, item in ipairs(backpack:GetChildren()) do
+                            if item:IsA("Tool") then
+                                item.Parent = player.Character
+                                break
+                            end
                         end
                     end
                 end
-            end
 
-            local activeTool = player.Character:FindFirstChildOfClass("Tool")
-            if activeTool then
-                activeTool:Activate()
+                local activeTool = player.Character:FindFirstChildOfClass("Tool")
+                if activeTool then
+                    activeTool:Activate()
+                end
             end
-        end
+        end)
     end
 end
 
-spawnTask(equipAndFarm)
+safeSpawn(equipAndFarm)
 
 -- Tool Farm Functionality (guarded against duplicate loops on repeated clicks)
 local toolFarmRunning = false
@@ -188,15 +243,17 @@ w:Button("Tool Farm", function()
         return
     end
     toolFarmRunning = true
-    spawnTask(function()
-        local player = Players.LocalPlayer
+    safeSpawn(function()
         while toolFarmRunning do
-            local char = player and player.Character
-            local tool = char and char:FindFirstChildOfClass("Tool")
-            if tool then
-                tool:Activate()
-            end
-            waitTask()
+            pcall(function()
+                local player = Players.LocalPlayer
+                local char = player and player.Character
+                local tool = char and char:FindFirstChildOfClass("Tool")
+                if tool then
+                    tool:Activate()
+                end
+            end)
+            safeWait()
         end
     end)
 end)
