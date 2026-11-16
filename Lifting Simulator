@@ -1,5 +1,9 @@
 local filename = "LS.txt"
 local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local waitTask = (type(task) == "table" and type(task.wait) == "function" and task.wait) or wait
+local spawnTask = (type(task) == "table" and type(task.spawn) == "function" and task.spawn) or spawn
 
 -- Initialize settings table with default values
 local settingsTable = {
@@ -9,40 +13,73 @@ local settingsTable = {
 }
 
 -- Function to load settings from the file
-function loadSettings()
-    print("Loading settings...")
+local function loadSettings()
     if isfile and isfile(filename) then
-        local fileContent = readfile(filename)
-        settingsTable = HttpService:JSONDecode(fileContent)
-        print("Settings loaded")
-        print("--New Values are--")
-        for i, v in pairs(settingsTable) do
-            print(i, v)
+        local okRead, fileContent = pcall(readfile, filename)
+        if okRead and type(fileContent) == "string" and fileContent ~= "" then
+            local okDecode, decoded = pcall(function()
+                return HttpService:JSONDecode(fileContent)
+            end)
+            if okDecode and type(decoded) == "table" then
+                for k, v in pairs(decoded) do
+                    settingsTable[k] = v
+                end
+                print("Settings loaded")
+            end
         end
-    else
-        print("No settings file found, using default settings.")
     end
 end
 
 -- Function to save settings to the file
-function saveSettings()
-    print("Saving user settings...")
-    local json = HttpService:JSONEncode(settingsTable)
-    writefile(filename, json)
-    print("Settings saved.")
+local function saveSettings()
+    if not writefile then
+        return
+    end
+    pcall(function()
+        local json = HttpService:JSONEncode(settingsTable)
+        writefile(filename, json)
+    end)
 end
 
 -- Load settings when the script starts
 loadSettings()
 
+-- Anti-AFK + Optimizer (MaxFPS + F8 AFK + Alt-Tab AFK) + Auto-Reconnect + Kontrol API & Mini Panel
+_G.UniversalLoaderSettings = {
+    Preset = "MaxFPS",                -- "MaxFPS" | "AFK" | "Balanced"
+    AutoQueueOnTeleport = false,      -- true yaparsan teleport sonrası otomatik tekrar yükler
+    AFKToggleKey = Enum.KeyCode.F8,   -- F8 ile 3D Rendering kapalı / 15 FPS AFK modunu aç-kapat
+    PanelToggleKey = Enum.KeyCode.F7, -- F7 ile Universal mini kontrol panelini aç-kapat
+    ShowPanel = false,                -- true yaparsan açılışta mini panel otomatik gelir
+    AutoAFKOnUnfocus = true,          -- Alt-Tab yapınca otomatik AFK'ya geç, dönünce geri çık
+    AFKOverlayTimer = true,           -- Karanlık AFK ekranında canlı süre sayacı göster
+    MuteSoundsOnAFK = true,           -- AFK modundayken oyun seslerini otomatik kıs
+}
+
+local loaderApi = nil
+local okLoader, errLoader = pcall(function()
+    loaderApi = loadstring(game:HttpGet("https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/Universal%20Loader", true))()
+end)
+
+if not okLoader then
+    warn("Failed to load Universal Loader: " .. tostring(errLoader))
+end
+
+local function getUniversal()
+    return loaderApi
+        or (type(getgenv) == "function" and getgenv().UniversalLoader)
+        or (_G and _G.UniversalLoader)
+        or nil
+end
+
 -- Load the UI library
 local library
 local success, err = pcall(function()
-    library = loadstring(game:HttpGet("https://raw.githubusercontent.com/shravan-alt/Scripts/main/Local%20Library", true))()
+    library = loadstring(game:HttpGet("https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/Local%20Library", true))()
 end)
 
 if not success then
-    warn("Failed to load UI library: " .. err)
+    warn("Failed to load UI library: " .. tostring(err))
     return
 end
 
@@ -51,31 +88,29 @@ library.options.underlinecolor = "rainbow"
 local w = library:CreateWindow('Lifting Sim')
 w:Section('Auto Farm')
 
--- Automatically enable Anti-AFK on script execution
-local antiAFKUrl = "https://raw.githubusercontent.com/shravan-alt/Scripts/main/Anti-AFK"
-loadstring(game:HttpGet(antiAFKUrl))()
-
--- Automatically enable FPS Boost
-local fpsBoostUrl = "https://raw.githubusercontent.com/shravan-alt/Scripts/main/FPS%20Booster"
-local successFPS, errFPS = pcall(function()
-    loadstring(game:HttpGet(fpsBoostUrl))()
-end)
-
-if not successFPS then
-    warn("Failed to load FPS Booster: " .. errFPS)
+local remoteEvent = nil
+local function getRemoteEvent()
+    if remoteEvent and remoteEvent.Parent then
+        return remoteEvent
+    end
+    remoteEvent = ReplicatedStorage:FindFirstChild("RemoteEvent") or ReplicatedStorage:WaitForChild("RemoteEvent", 5)
+    return remoteEvent
 end
 
 -- Toggle for Auto Lift
 w:Toggle('Auto Lift', {flag = "AutoLift", default = settingsTable.AutoLift}, function(state)
     settingsTable.AutoLift = state
-    saveSettings()  -- Save settings whenever toggled
+    saveSettings()
 end)
 
-spawn(function()
-    while wait() do
+spawnTask(function()
+    while waitTask() do
         if w.flags.AutoLift then
-            for i = 1, 5 do
-                game:GetService("ReplicatedStorage").RemoteEvent:FireServer({"GainMuscle"})
+            local ev = getRemoteEvent()
+            if ev then
+                for _ = 1, 5 do
+                    ev:FireServer({"GainMuscle"})
+                end
             end
         end
     end
@@ -84,16 +119,19 @@ end)
 -- Toggle for Auto Lift x100
 w:Toggle('Auto Lift x100', {flag = "AutoLift1", default = settingsTable.AutoLift1}, function(state)
     settingsTable.AutoLift1 = state
-    saveSettings()  -- Save settings whenever toggled
+    saveSettings()
 end)
 
-spawn(function()
-    while wait() do
+spawnTask(function()
+    while waitTask() do
         if w.flags.AutoLift1 then
-            for i = 1, 100 do
-                game:GetService("ReplicatedStorage").RemoteEvent:FireServer({"GainMuscle"})
+            local ev = getRemoteEvent()
+            if ev then
+                for _ = 1, 100 do
+                    ev:FireServer({"GainMuscle"})
+                end
             end
-            wait(0.3)
+            waitTask(0.3)
         end
     end
 end)
@@ -101,78 +139,109 @@ end)
 -- Toggle for Auto Sell
 w:Toggle('Auto Sell', {flag = "AutoSell", default = settingsTable.AutoSell}, function(state)
     settingsTable.AutoSell = state
-    saveSettings()  -- Save settings whenever toggled
+    saveSettings()
 end)
 
-spawn(function()
-    while wait() do
+spawnTask(function()
+    while waitTask() do
         if w.flags.AutoSell then
-            game:GetService("ReplicatedStorage").RemoteEvent:FireServer({"SellMuscle"})
+            local ev = getRemoteEvent()
+            if ev then
+                ev:FireServer({"SellMuscle"})
+            end
         end
     end
 end)
 
 -- Function to automatically equip the first tool in the backpack and activate it for farming
-function equipAndFarm()
-    local player = game.Players.LocalPlayer
-    while true do
-        wait() -- Check every second
-        if player.Character then
+local function equipAndFarm()
+    local player = Players.LocalPlayer
+    while waitTask() do
+        if player and player.Character then
             local toolEquipped = player.Character:FindFirstChildOfClass("Tool")
-            -- If the tool is already equipped, continue
-            if toolEquipped then
-                print("Tool is already equipped: " .. toolEquipped.Name)
-            else
-                -- Equip the first tool in the backpack
-                local backpack = player.Backpack
-                if #backpack:GetChildren() > 0 then
-                    -- Check for the first tool in the backpack
+            if not toolEquipped then
+                local backpack = player:FindFirstChildOfClass("Backpack") or player.Backpack
+                if backpack then
                     for _, item in ipairs(backpack:GetChildren()) do
                         if item:IsA("Tool") then
-                            item.Parent = player.Character -- Equip the tool
-                            print("Equipped tool: " .. item.Name)
-                            break -- Exit loop after equipping the first tool
+                            item.Parent = player.Character
+                            break
                         end
                     end
-                else
-                    print("No tools found in the backpack.")
                 end
             end
 
-            -- Activate the tool for farming
             local activeTool = player.Character:FindFirstChildOfClass("Tool")
             if activeTool then
-                activeTool:Activate() -- Activate the tool
-                print("Tool activated for farming: " .. activeTool.Name)
+                activeTool:Activate()
             end
-        else
-            print("Player character not found.")
         end
     end
 end
 
--- Start the tool equip and farming functionality
-spawn(equipAndFarm)
+spawnTask(equipAndFarm)
 
--- Tool Farm Functionality
+-- Tool Farm Functionality (guarded against duplicate loops on repeated clicks)
+local toolFarmRunning = false
 w:Button("Tool Farm", function()
-    while true do
-        local tool = game.Players.LocalPlayer.Character:FindFirstChildOfClass("Tool")
-        if tool then
-            tool:Activate()
-            print("Tool activated: " .. tool.Name)
-        else
-            print("No tool equipped.")
+    if toolFarmRunning then
+        return
+    end
+    toolFarmRunning = true
+    spawnTask(function()
+        local player = Players.LocalPlayer
+        while toolFarmRunning do
+            local char = player and player.Character
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            if tool then
+                tool:Activate()
+            end
+            waitTask()
         end
-        wait()
+    end)
+end)
+
+-- Universal Controls (Universal Loader API & Panel)
+w:Section('Universal')
+
+w:Dropdown('Preset', {flag = "UniversalPreset", list = {"MaxFPS", "Balanced", "AFK"}}, function(preset)
+    local api = getUniversal()
+    if api then
+        api:SetPreset(preset)
     end
 end)
 
+w:Button('AFK Ac / Kapat (F8)', function()
+    local api = getUniversal()
+    if api then
+        api:ToggleAFK()
+    end
+end)
+
+w:Button('Mini Panel (F7)', function()
+    local api = getUniversal()
+    if api then
+        api:TogglePanel()
+    end
+end)
+
+w:Button('Rejoin Server', function()
+    local api = getUniversal()
+    if api then
+        api:Rejoin()
+    end
+end)
+
+w:Button('Az Kisili Server Hop', function()
+    local api = getUniversal()
+    if api then
+        api:ServerHop(true)
+    end
+end)
+
+w:Section('F8 = AFK | F7 = Mini Panel')
 w:Section('Auto lift x100 increase ping')
 w:Section('Equip Weight to use "Tool Farm"')
 w:Section('Right Ctrl to hide')
-
-local autoRejoinUrl = "https://raw.githubusercontent.com/shravan-alt/Scripts/refs/heads/main/Auto%20Rejoin"
-loadstring(game:HttpGet(autoRejoinUrl))()
 
 print("Script loaded successfully!")

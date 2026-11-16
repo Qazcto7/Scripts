@@ -767,10 +767,21 @@ local function startOverlayTimer()
         return
     end
     state.overlayThread = spawnTask(function()
+        local stuckTicks = 0
         while isActive() and state.afkRenderDisabled and state.afkOverlay do
+            local beforeTick = clockNow()
             waitTask(1)
             if not isActive() or not state.afkRenderDisabled or not state.afkOverlay then
                 break
+            end
+            local afterTick = clockNow()
+            if afterTick <= beforeTick then
+                stuckTicks = stuckTicks + 1
+                if stuckTicks >= 3 then
+                    break
+                end
+            else
+                stuckTicks = 0
             end
             updateOverlayStatusLabel()
         end
