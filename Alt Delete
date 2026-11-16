@@ -1,0 +1,236 @@
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if type(env.__ClickDeleteState) == "table" and type(env.__ClickDeleteState.cleanup) == "function" then
+    pcall(env.__ClickDeleteState.cleanup)
+end
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local history = {}
+local connections = {}
+local isCleanedUp = false
+local MAX_HISTORY = 100
+
+local state = {
+    enabled = true,
+}
+
+local selectionBox = nil
+pcall(function()
+    selectionBox = Instance.new("SelectionBox")
+    selectionBox.Name = "__ClickDeletePreview"
+    selectionBox.LineThickness = 0.04
+    selectionBox.Color3 = Color3.fromRGB(255, 75, 75)
+    selectionBox.SurfaceColor3 = Color3.fromRGB(255, 75, 75)
+    selectionBox.SurfaceTransparency = 0.85
+    selectionBox.Visible = false
+end)
+
+local function isKeyHeld(keyCode)
+    local ok, held = pcall(UserInputService.IsKeyDown, UserInputService, keyCode)
+    return ok and held == true
+end
+
+local function isAltHeld()
+    return isKeyHeld(Enum.KeyCode.LeftAlt) or isKeyHeld(Enum.KeyCode.RightAlt)
+end
+
+local function isCtrlHeld()
+    return isKeyHeld(Enum.KeyCode.LeftControl) or isKeyHeld(Enum.KeyCode.RightControl)
+end
+
+local function isShiftHeld()
+    return isKeyHeld(Enum.KeyCode.LeftShift) or isKeyHeld(Enum.KeyCode.RightShift)
+end
+
+local function isProtectedTarget(inst)
+    if not inst then
+        return true
+    end
+    local ok, protected = pcall(function()
+        if inst:IsA("Terrain") or inst == Workspace or inst == game then
+            return true
+        end
+        local char = LocalPlayer and LocalPlayer.Character
+        if char and (inst == char or inst:IsDescendantOf(char)) then
+            return true
+        end
+        return false
+    end)
+    return (not ok) or protected
+end
+
+local function resolveRaycastTarget()
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return nil
+    end
+    local mPos = UserInputService:GetMouseLocation()
+    local ray = cam:ViewportPointToRay(mPos.X, mPos.Y)
+    local params = RaycastParams and RaycastParams.new()
+    if params and LocalPlayer and LocalPlayer.Character then
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { LocalPlayer.Character }
+    end
+    local result
+    if params then
+        result = Workspace:Raycast(ray.Origin, ray.Direction * 1500, params)
+    else
+        result = Workspace:Raycast(ray.Origin, ray.Direction * 1500)
+    end
+    return result and result.Instance or nil
+end
+
+local function getHoveredTarget()
+    local okRay, rayTarget = pcall(resolveRaycastTarget)
+    if okRay and rayTarget then
+        return rayTarget
+    end
+    if LocalPlayer and type(LocalPlayer.GetMouse) == "function" then
+        local okMouse, mouse = pcall(LocalPlayer.GetMouse, LocalPlayer)
+        if okMouse and mouse then
+            return mouse.Target
+        end
+    end
+    return nil
+end
+
+local function resolveDeleteTarget(rawTarget)
+    if isShiftHeld() then
+        local okModel, model = pcall(function()
+            local ancestor = rawTarget:FindFirstAncestorOfClass("Model")
+            if ancestor and ancestor ~= Workspace then
+                return ancestor
+            end
+            return nil
+        end)
+        if okModel and model then
+            return model
+        end
+    end
+    return rawTarget
+end
+
+local function clearPreview()
+    if selectionBox then
+        pcall(function()
+            selectionBox.Adornee = nil
+            selectionBox.Visible = false
+            selectionBox.Parent = nil
+        end)
+    end
+end
+
+local function track(signal, fn)
+    if not signal then
+        return
+    end
+    local ok, conn = pcall(function()
+        return signal:Connect(fn)
+    end)
+    if ok and conn then
+        connections[#connections + 1] = conn
+    end
+end
+
+state.cleanup = function()
+    if isCleanedUp then
+        return
+    end
+    isCleanedUp = true
+    state.enabled = false
+    clearPreview()
+    if selectionBox then
+        pcall(function()
+            selectionBox:Destroy()
+        end)
+        selectionBox = nil
+    end
+    for i = #connections, 1, -1 do
+        local c = connections[i]
+        connections[i] = nil
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+end
+env.__ClickDeleteState = state
+
+local function deleteHovered()
+    local rawTarget = getHoveredTarget()
+    local target = rawTarget and resolveDeleteTarget(rawTarget) or nil
+    if target and not isProtectedTarget(target) then
+        local okHide = pcall(function()
+            local origParent = target.Parent
+            if origParent then
+                history[#history + 1] = { inst = target, parent = origParent }
+                if #history > MAX_HISTORY then
+                    table.remove(history, 1)
+                end
+                target.Parent = nil
+            end
+        end)
+        if okHide then
+            clearPreview()
+        end
+    end
+end
+
+local function undoLast()
+    for i = #history, 1, -1 do
+        local entry = history[i]
+        history[i] = nil
+        if entry and entry.inst and entry.parent then
+            local okParent, isAlive = pcall(function()
+                return entry.parent == Workspace or entry.parent.Parent ~= nil
+            end)
+            if okParent and isAlive then
+                local okRestore = pcall(function()
+                    entry.inst.Parent = entry.parent
+                end)
+                if okRestore then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+track(UserInputService.InputBegan, function(input, gameProcessed)
+    if isCleanedUp or not state.enabled or gameProcessed or not input then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and isAltHeld() then
+        deleteHovered()
+    elseif input.KeyCode == Enum.KeyCode.Delete and isAltHeld() then
+        deleteHovered()
+    elseif input.KeyCode == Enum.KeyCode.Z and (isCtrlHeld() or isAltHeld()) then
+        undoLast()
+    end
+end)
+
+if RunService and RunService.RenderStepped then
+    track(RunService.RenderStepped, function()
+        if isCleanedUp or not state.enabled or not selectionBox or not isAltHeld() then
+            clearPreview()
+            return
+        end
+        local rawTarget = getHoveredTarget()
+        local target = rawTarget and resolveDeleteTarget(rawTarget) or nil
+        if target and not isProtectedTarget(target) then
+            pcall(function()
+                selectionBox.Adornee = target
+                selectionBox.Parent = Workspace
+                selectionBox.Visible = true
+            end)
+        else
+            clearPreview()
+        end
+    end)
+end
+
+print("[ClickDelete] Loaded! Alt+Click or Alt+Del: Delete | Shift+Alt+Click: Delete Model | Ctrl+Z / Alt+Z: Undo")

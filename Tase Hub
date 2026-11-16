@@ -1,0 +1,876 @@
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if type(env.__TaseHubState) == "table" and type(env.__TaseHubState.cleanup) == "function" then
+    pcall(env.__TaseHubState.cleanup)
+end
+
+local okRay, Rayfield = pcall(function()
+    return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+if not okRay or not Rayfield then
+    warn("[TaseHub] Rayfield failed to load: " .. tostring(Rayfield))
+    return
+end
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+while Players and not LocalPlayer do
+    task.wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+local TEAM_COLORS = {
+    Police = Color3.fromRGB(0, 120, 255),
+    Prisoner = Color3.fromRGB(255, 170, 0),
+    Criminal = Color3.fromRGB(255, 0, 0),
+}
+
+local cfg = {
+    Aimbot = false,
+    RequireRightClick = false,
+    AimFOV = 150,
+    Smoothness = 1,
+    TargetPart = "Head",
+    TeamCheck = false,
+    WallCheck = true,
+    Prediction = true,
+    BulletSpeed = 2500,
+    SpeedValue = 16,
+    InfJump = false,
+    NoClip = false,
+    ESP = false,
+    NameTags = false,
+    RainbowFOV = false,
+}
+
+local state = {
+    unloaded = false,
+    connections = {},
+    playerConns = {},
+    activeTags = {},
+    activeHighlights = {},
+    avatarCache = {},
+    noclipParts = {},
+    lastWalkSpeedApplied = false,
+}
+
+local function isActive()
+    return (not state.unloaded) and env.__TaseHubState == state
+end
+
+local function track(signal, fn)
+    if not signal then
+        return nil
+    end
+    local ok, conn = pcall(function()
+        return signal:Connect(fn)
+    end)
+    if ok and conn then
+        state.connections[#state.connections + 1] = conn
+        return conn
+    end
+    return nil
+end
+
+local function disconnectConn(conn)
+    if conn then
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+end
+
+local function destroySafe(obj)
+    if obj then
+        pcall(function()
+            obj:Destroy()
+        end)
+    end
+end
+
+local function getTeamColor(player)
+    local team = player and player.Team
+    if team then
+        if TEAM_COLORS[team.Name] then
+            return TEAM_COLORS[team.Name]
+        end
+        local okColor, tColor = pcall(function()
+            return team.TeamColor and team.TeamColor.Color
+        end)
+        if okColor and tColor then
+            return tColor
+        end
+    end
+    return Color3.fromRGB(255, 255, 255)
+end
+
+local Circle = nil
+pcall(function()
+    if type(Drawing) == "table" and type(Drawing.new) == "function" then
+        Circle = Drawing.new("Circle")
+        Circle.Visible = false
+        Circle.Thickness = 2
+        Circle.Radius = cfg.AimFOV
+        Circle.Color = Color3.fromRGB(255, 255, 255)
+        Circle.Filled = false
+    end
+end)
+
+local function clearHighlight(player)
+    local h = state.activeHighlights[player]
+    state.activeHighlights[player] = nil
+    destroySafe(h)
+end
+
+local function clearTag(player)
+    local data = state.activeTags[player]
+    state.activeTags[player] = nil
+    if not data then
+        return
+    end
+    disconnectConn(data.healthConn)
+    disconnectConn(data.maxHealthConn)
+    destroySafe(data.gui)
+end
+
+local function clearPlayerVisuals(player)
+    clearHighlight(player)
+    clearTag(player)
+end
+
+local function disconnectPlayerSignals(player)
+    local list = state.playerConns[player]
+    state.playerConns[player] = nil
+    if list then
+        for i = 1, #list do
+            disconnectConn(list[i])
+        end
+    end
+end
+
+local function restoreNoClip()
+    for part, origCollide in pairs(state.noclipParts) do
+        state.noclipParts[part] = nil
+        if part then
+            pcall(function()
+                if part.Parent then
+                    part.CanCollide = origCollide
+                end
+            end)
+        end
+    end
+end
+
+local function syncPlayerHighlight(player)
+    if not isActive() or player == LocalPlayer then
+        return
+    end
+    local char = player.Character
+    if not cfg.ESP or not char then
+        clearHighlight(player)
+        return
+    end
+
+    local color = getTeamColor(player)
+    local existing = state.activeHighlights[player]
+    if existing then
+        local okAlive, alive = pcall(function()
+            return existing.Parent == char
+        end)
+        if okAlive and alive then
+            pcall(function()
+                existing.FillColor = color
+                existing.OutlineColor = color
+            end)
+            return
+        end
+    end
+
+    clearHighlight(player)
+    pcall(function()
+        local stale = char:FindFirstChild("TaseHubESP") or char:FindFirstChild("ZenithESP")
+        if stale then
+            stale:Destroy()
+        end
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "TaseHubESP"
+        highlight.FillColor = color
+        highlight.OutlineColor = color
+        highlight.FillTransparency = 0.55
+        highlight.OutlineTransparency = 0
+        highlight.Parent = char
+        state.activeHighlights[player] = highlight
+    end)
+end
+
+local function createNameTag(player, character)
+    if not isActive() or not cfg.NameTags or not character then
+        return
+    end
+    local head = character:FindFirstChild("Head")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not head or not humanoid then
+        return
+    end
+
+    local existing = state.activeTags[player]
+    if existing then
+        local okAlive, alive = pcall(function()
+            return existing.gui and existing.gui.Parent == head and existing.head == head
+        end)
+        if okAlive and alive then
+            pcall(function()
+                existing.stroke.Color = getTeamColor(player)
+            end)
+            return
+        end
+        clearTag(player)
+    end
+
+    pcall(function()
+        local old = head:FindFirstChild("CustomNameTag")
+        if old then
+            old:Destroy()
+        end
+
+        local gui = Instance.new("BillboardGui")
+        gui.Name = "CustomNameTag"
+        gui.Adornee = head
+        gui.Size = UDim2.fromOffset(112, 32)
+        gui.StudsOffset = Vector3.new(0, 2.7, 0)
+        gui.AlwaysOnTop = true
+        gui.MaxDistance = 0
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.fromScale(1, 1)
+        frame.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
+        frame.BackgroundTransparency = 0.1
+        frame.BorderSizePixel = 0
+        frame.Parent = gui
+
+        local uiScale = Instance.new("UIScale")
+        uiScale.Scale = 1
+        uiScale.Parent = frame
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = frame
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 1
+        stroke.Color = getTeamColor(player)
+        stroke.Parent = frame
+
+        local avatar = Instance.new("ImageLabel")
+        avatar.Size = UDim2.fromOffset(27, 27)
+        avatar.Position = UDim2.fromOffset(3, 2)
+        avatar.BackgroundTransparency = 1
+        avatar.Parent = frame
+
+        local avatarCorner = Instance.new("UICorner")
+        avatarCorner.CornerRadius = UDim.new(0, 5)
+        avatarCorner.Parent = avatar
+
+        local cachedThumb = state.avatarCache[player.UserId]
+        if cachedThumb then
+            avatar.Image = cachedThumb
+        else
+            task.spawn(function()
+                local okThumb, image = pcall(function()
+                    return Players:GetUserThumbnailAsync(
+                        player.UserId,
+                        Enum.ThumbnailType.HeadShot,
+                        Enum.ThumbnailSize.Size100x100
+                    )
+                end)
+                if okThumb and type(image) == "string" and image ~= "" then
+                    state.avatarCache[player.UserId] = image
+                    if isActive() and avatar.Parent then
+                        avatar.Image = image
+                    end
+                end
+            end)
+        end
+
+        local nameLbl = Instance.new("TextLabel")
+        nameLbl.Position = UDim2.fromOffset(35, 2)
+        nameLbl.Size = UDim2.new(1, -40, 0, 15)
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.Text = player.Name
+        nameLbl.TextColor3 = Color3.new(1, 1, 1)
+        nameLbl.TextSize = 10
+        nameLbl.Font = Enum.Font.GothamBold
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+        nameLbl.Parent = frame
+
+        local hpBackground = Instance.new("Frame")
+        hpBackground.Position = UDim2.fromOffset(35, 21)
+        hpBackground.Size = UDim2.new(1, -40, 0, 6)
+        hpBackground.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+        hpBackground.BorderSizePixel = 0
+        hpBackground.ClipsDescendants = true
+        hpBackground.Parent = frame
+
+        local hpCorner = Instance.new("UICorner")
+        hpCorner.CornerRadius = UDim.new(1, 0)
+        hpCorner.Parent = hpBackground
+
+        local hpFill = Instance.new("Frame")
+        hpFill.Size = UDim2.fromScale(1, 1)
+        hpFill.BackgroundColor3 = Color3.fromRGB(50, 220, 100)
+        hpFill.BorderSizePixel = 0
+        hpFill.Parent = hpBackground
+
+        local fillCorner = Instance.new("UICorner")
+        fillCorner.CornerRadius = UDim.new(1, 0)
+        fillCorner.Parent = hpFill
+
+        local function updateHealth()
+            if not isActive() then
+                return
+            end
+            local percent = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+            hpFill.Size = UDim2.fromScale(percent, 1)
+            stroke.Color = getTeamColor(player)
+            if percent <= 0.25 then
+                hpFill.BackgroundColor3 = Color3.fromRGB(240, 65, 65)
+            elseif percent <= 0.5 then
+                hpFill.BackgroundColor3 = Color3.fromRGB(240, 190, 60)
+            else
+                hpFill.BackgroundColor3 = Color3.fromRGB(50, 220, 100)
+            end
+        end
+
+        local hConn = humanoid.HealthChanged:Connect(updateHealth)
+        local mhConn = nil
+        if type(humanoid.GetPropertyChangedSignal) == "function" then
+            local okMh, mhSig = pcall(humanoid.GetPropertyChangedSignal, humanoid, "MaxHealth")
+            if okMh and mhSig then
+                mhConn = mhSig:Connect(updateHealth)
+            end
+        end
+        updateHealth()
+
+        gui.Parent = head
+        state.activeTags[player] = {
+            gui = gui,
+            head = head,
+            scale = uiScale,
+            stroke = stroke,
+            healthConn = hConn,
+            maxHealthConn = mhConn,
+        }
+    end)
+end
+
+local function syncPlayerVisuals(player)
+    if not isActive() or player == LocalPlayer then
+        return
+    end
+    syncPlayerHighlight(player)
+    if cfg.NameTags and player.Character then
+        createNameTag(player, player.Character)
+    else
+        clearTag(player)
+    end
+end
+
+local function syncAllVisuals()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            syncPlayerVisuals(p)
+        end
+    end
+end
+
+local function hookPlayer(player)
+    if player == LocalPlayer then
+        return
+    end
+    disconnectPlayerSignals(player)
+    local list = {}
+    state.playerConns[player] = list
+
+    local function bindCharacter(char)
+        if not isActive() or not char then
+            return
+        end
+        syncPlayerVisuals(player)
+        if not (char:FindFirstChild("Head") and char:FindFirstChildOfClass("Humanoid")) then
+            local childConn
+            childConn = char.ChildAdded:Connect(function()
+                if not isActive() or not char.Parent then
+                    disconnectConn(childConn)
+                    return
+                end
+                if char:FindFirstChild("Head") and char:FindFirstChildOfClass("Humanoid") then
+                    disconnectConn(childConn)
+                    syncPlayerVisuals(player)
+                end
+            end)
+            list[#list + 1] = childConn
+        end
+    end
+
+    if player.Character then
+        bindCharacter(player.Character)
+    end
+    list[#list + 1] = player.CharacterAdded:Connect(bindCharacter)
+    list[#list + 1] = player.CharacterRemoving:Connect(function()
+        clearPlayerVisuals(player)
+    end)
+    if type(player.GetPropertyChangedSignal) == "function" then
+        local okSig, sig = pcall(player.GetPropertyChangedSignal, player, "Team")
+        if okSig and sig then
+            list[#list + 1] = sig:Connect(function()
+                syncPlayerVisuals(player)
+            end)
+        end
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    hookPlayer(p)
+end
+track(Players.PlayerAdded, hookPlayer)
+track(Players.PlayerRemoving, function(player)
+    clearPlayerVisuals(player)
+    disconnectPlayerSignals(player)
+    state.avatarCache[player.UserId] = nil
+end)
+if LocalPlayer and LocalPlayer.CharacterRemoving then
+    track(LocalPlayer.CharacterRemoving, function()
+        state.noclipParts = {}
+    end)
+end
+
+local Window = Rayfield:CreateWindow({
+    Name = "Tase Hub",
+    LoadingTitle = "Tase Hub",
+    LoadingSubtitle = "by banibacks",
+    ConfigurationSaving = { Enabled = false },
+})
+
+local CombatTab = Window:CreateTab("Combat")
+local MoveTab = Window:CreateTab("Movement")
+local VisualTab = Window:CreateTab("Visuals")
+local SettingsTab = Window:CreateTab("Settings")
+
+CombatTab:CreateToggle({
+    Name = "Aimbot",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.Aimbot = v == true
+        if Circle then
+            Circle.Visible = cfg.Aimbot
+        end
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Require Right Click",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.RequireRightClick = v == true
+    end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Aim FOV",
+    Range = { 50, 500 },
+    Increment = 10,
+    CurrentValue = 150,
+    Callback = function(v)
+        cfg.AimFOV = v
+    end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Smoothness",
+    Range = { 1, 20 },
+    Increment = 1,
+    CurrentValue = 1,
+    Callback = function(v)
+        cfg.Smoothness = math.max(1, v)
+    end,
+})
+
+CombatTab:CreateDropdown({
+    Name = "Target Part",
+    Options = { "Head", "HumanoidRootPart" },
+    CurrentOption = { "Head" },
+    MultipleOptions = false,
+    Callback = function(opt)
+        local chosen = type(opt) == "table" and opt[1] or opt
+        if type(chosen) == "string" and chosen ~= "" then
+            cfg.TargetPart = chosen
+        end
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.TeamCheck = v == true
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Wall Check",
+    CurrentValue = true,
+    Callback = function(v)
+        cfg.WallCheck = v == true
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Prediction",
+    CurrentValue = true,
+    Callback = function(v)
+        cfg.Prediction = v == true
+    end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Bullet Speed",
+    Range = { 500, 5000 },
+    Increment = 100,
+    CurrentValue = 2500,
+    Callback = function(v)
+        cfg.BulletSpeed = math.max(100, v)
+    end,
+})
+
+MoveTab:CreateSlider({
+    Name = "SpeedHack",
+    Range = { 16, 120 },
+    Increment = 2,
+    CurrentValue = 16,
+    Callback = function(v)
+        cfg.SpeedValue = v
+        if v == 16 and state.lastWalkSpeedApplied then
+            state.lastWalkSpeedApplied = false
+            local char = LocalPlayer and LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = 16
+            end
+        end
+    end,
+})
+
+MoveTab:CreateToggle({
+    Name = "Infinite Jump",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.InfJump = v == true
+    end,
+})
+
+MoveTab:CreateToggle({
+    Name = "NoClip",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.NoClip = v == true
+        if not cfg.NoClip then
+            restoreNoClip()
+        end
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name = "Player ESP",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.ESP = v == true
+        syncAllVisuals()
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name = "Name Tags",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.NameTags = v == true
+        syncAllVisuals()
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name = "Rainbow FOV",
+    CurrentValue = false,
+    Callback = function(v)
+        cfg.RainbowFOV = v == true
+        if not cfg.RainbowFOV and Circle then
+            Circle.Color = Color3.fromRGB(255, 255, 255)
+        end
+    end,
+})
+
+VisualTab:CreateButton({
+    Name = "FPS Boost",
+    Callback = function()
+        task.spawn(function()
+            local smooth = Enum.Material.SmoothPlastic
+            local okList, descendants = pcall(Workspace.GetDescendants, Workspace)
+            if not okList or type(descendants) ~= "table" then
+                return
+            end
+            local playerChars = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p.Character then
+                    playerChars[p.Character] = true
+                end
+            end
+            local function isCharacterPart(inst)
+                local node = inst
+                while node and node ~= Workspace do
+                    if playerChars[node] then
+                        return true
+                    end
+                    node = node.Parent
+                end
+                return false
+            end
+            for i = 1, #descendants do
+                if not isActive() then
+                    return
+                end
+                local inst = descendants[i]
+                if inst then
+                    pcall(function()
+                        if inst:IsA("BasePart") and not inst:IsA("Terrain") and not isCharacterPart(inst) then
+                            inst.Material = smooth
+                            inst.Reflectance = 0
+                            inst.CastShadow = false
+                        end
+                    end)
+                end
+                if i % 256 == 0 then
+                    task.wait()
+                end
+            end
+        end)
+    end,
+})
+
+state.cleanup = function()
+    if state.unloaded then
+        return
+    end
+    state.unloaded = true
+    restoreNoClip()
+    if state.lastWalkSpeedApplied then
+        local char = LocalPlayer and LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function()
+                hum.WalkSpeed = 16
+            end)
+        end
+    end
+    for p in pairs(state.playerConns) do
+        clearPlayerVisuals(p)
+        disconnectPlayerSignals(p)
+    end
+    for p in pairs(state.activeHighlights) do
+        clearHighlight(p)
+    end
+    for p in pairs(state.activeTags) do
+        clearTag(p)
+    end
+    for i = #state.connections, 1, -1 do
+        disconnectConn(state.connections[i])
+        state.connections[i] = nil
+    end
+    if Circle then
+        pcall(function()
+            Circle.Visible = false
+            if type(Circle.Remove) == "function" then
+                Circle:Remove()
+            elseif type(Circle.Destroy) == "function" then
+                Circle:Destroy()
+            end
+        end)
+        Circle = nil
+    end
+    if Rayfield and type(Rayfield.Destroy) == "function" then
+        pcall(function()
+            Rayfield:Destroy()
+        end)
+    end
+end
+env.__TaseHubState = state
+
+SettingsTab:CreateButton({
+    Name = "Unload Tase Hub",
+    Callback = function()
+        state.cleanup()
+    end,
+})
+
+-- Reusable RaycastParams (zero per-frame allocations)
+local rayParams = RaycastParams and RaycastParams.new() or nil
+local lastFilteredChar = nil
+if rayParams then
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.IgnoreWater = true
+end
+
+local function isLineOfSightClear(camPos, targetPos, targetChar)
+    if not rayParams then
+        return true
+    end
+    local myChar = LocalPlayer and LocalPlayer.Character
+    if myChar ~= lastFilteredChar then
+        lastFilteredChar = myChar
+        rayParams.FilterDescendantsInstances = myChar and { myChar } or {}
+    end
+    local ray = Workspace:Raycast(camPos, targetPos - camPos, rayParams)
+    if ray and ray.Instance then
+        return ray.Instance:IsDescendantOf(targetChar)
+    end
+    return true
+end
+
+local function isRightMouseHeld()
+    if not cfg.RequireRightClick then
+        return true
+    end
+    local ok, down = pcall(UIS.IsMouseButtonPressed, UIS, Enum.UserInputType.MouseButton2)
+    return ok and down == true
+end
+
+track(UIS.JumpRequest, function()
+    if not isActive() or not cfg.InfJump then
+        return
+    end
+    local char = LocalPlayer and LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+-- Run NoClip on Stepped so Humanoid collision overrides never push back
+local noclipSignal = RunService.Stepped or RunService.RenderStepped
+track(noclipSignal, function()
+    if not isActive() or not cfg.NoClip then
+        return
+    end
+    local myChar = LocalPlayer and LocalPlayer.Character
+    if not myChar then
+        return
+    end
+    for _, part in ipairs(myChar:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            if state.noclipParts[part] == nil then
+                state.noclipParts[part] = true
+            end
+            part.CanCollide = false
+        end
+    end
+end)
+
+local tagScaleAccum = 0
+
+-- Single consolidated RenderStepped loop (Movement WalkSpeed, FOV Circle, NameTag Scaling, Aimbot)
+track(RunService.RenderStepped, function(dt)
+    if not isActive() then
+        return
+    end
+
+    if cfg.SpeedValue ~= 16 then
+        local myChar = LocalPlayer and LocalPlayer.Character
+        local hum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.WalkSpeed = cfg.SpeedValue
+            state.lastWalkSpeedApplied = true
+        end
+    end
+
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return
+    end
+
+    local vp = cam.ViewportSize
+    local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+
+    if Circle then
+        Circle.Position = screenCenter
+        Circle.Radius = cfg.AimFOV
+        if cfg.RainbowFOV and cfg.Aimbot then
+            Circle.Color = Color3.fromHSV((os.clock() % 5) / 5, 1, 1)
+        end
+    end
+
+    -- Throttled NameTag distance scaling (~20 Hz instead of uncapped per-frame work)
+    tagScaleAccum = tagScaleAccum + (tonumber(dt) or 0.016)
+    if cfg.NameTags and tagScaleAccum >= 0.05 then
+        tagScaleAccum = 0
+        local camPos = cam.CFrame.Position
+        for player, data in pairs(state.activeTags) do
+            if data.gui and data.gui.Parent and data.head and data.head.Parent then
+                local dist = (camPos - data.head.Position).Magnitude
+                local alpha = math.clamp((dist - 15) / 145, 0, 1)
+                data.scale.Scale = 0.85 + ((1 - alpha) * 0.3)
+            else
+                clearTag(player)
+            end
+        end
+    end
+
+    if not cfg.Aimbot or not isRightMouseHeld() then
+        return
+    end
+
+    local camPos = cam.CFrame.Position
+    local bestTarget = nil
+    local shortestDist = cfg.AimFOV
+    local myTeam = LocalPlayer and LocalPlayer.Team
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local char = player.Character
+            if char then
+                local teamAllowed = not (cfg.TeamCheck and myTeam ~= nil and player.Team == myTeam)
+                local targetPart = teamAllowed and (char:FindFirstChild(cfg.TargetPart) or char:FindFirstChild("Head"))
+                local hum = targetPart and char:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    local screenPos, visible = cam:WorldToViewportPoint(targetPart.Position)
+                    if visible and screenPos.Z > 0 then
+                        local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                        if dist < shortestDist then
+                            if (not cfg.WallCheck) or isLineOfSightClear(camPos, targetPart.Position, char) then
+                                shortestDist = dist
+                                bestTarget = targetPart
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if bestTarget then
+        local aimPos = bestTarget.Position
+        if cfg.Prediction then
+            local vel = bestTarget.AssemblyLinearVelocity
+            local travelTime = (camPos - aimPos).Magnitude / math.max(cfg.BulletSpeed, 1)
+            aimPos = aimPos + (vel * travelTime)
+        end
+        local goalCFrame = CFrame.new(camPos, aimPos)
+        if cfg.Smoothness <= 1 then
+            cam.CFrame = goalCFrame
+        else
+            local frameAlpha = math.clamp(((tonumber(dt) or 0.016) * 60) / cfg.Smoothness, 0.02, 1)
+            cam.CFrame = cam.CFrame:Lerp(goalCFrame, frameAlpha)
+        end
+    end
+end)
