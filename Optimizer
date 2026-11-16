@@ -1079,7 +1079,10 @@ end
 applyGlobalSettings()
 
 local function scanContainer(container, budget)
-    local descendants = container:GetDescendants()
+    local okDesc, descendants = pcall(container.GetDescendants, container)
+    if not okDesc or type(descendants) ~= "table" then
+        return 0, 0, 0
+    end
     local total = #descendants
     local optimized = 0
     local workTime = 0
@@ -1129,6 +1132,10 @@ if Workspace.CurrentCamera then
             optimizeInstance(inst)
         end
     end
+end
+
+if isActive() then
+    print("[Optimizer] Optimizer script loaded")
 end
 
 -- Scan full Lighting & Workspace across frames without freezing the client
