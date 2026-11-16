@@ -92,7 +92,8 @@ loadSettings()
 -- Anti-AFK + Optimizer (MaxFPS + F8 AFK + Unfocus AFK) + Auto-Reconnect + Control API & Mini Panel
 _G.UniversalLoaderSettings = {
     Preset = "MaxFPS",                -- "MaxFPS" | "AFK" | "Balanced"
-    AutoQueueOnTeleport = false,      -- set true to auto-reload after teleport / rejoin
+    AutoQueueOnTeleport = true,       -- auto-reload after teleport / server hop / rejoin
+    QueueUrl = "https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/Lifting%20Simulator",
     AFKToggleKey = Enum.KeyCode.F8,   -- F8 toggles 3D Rendering pause / 15 FPS AFK mode
     PanelToggleKey = Enum.KeyCode.F7, -- F7 toggles Universal mini control panel
     ShowPanel = false,                -- set true to display mini panel on startup

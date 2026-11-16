@@ -3,6 +3,7 @@ local DEFAULT_SETTINGS = {
     Preset = "Balanced", -- "Balanced" | "MaxFPS" | "AFK"
     BaseUrl = "https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/",
     LoaderUrl = "https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/Universal%20Loader",
+    QueueUrl = nil,
     LoadAntiAFK = true,
     LoadOptimizer = true,
     LoadAutoReconnect = true,
@@ -604,7 +605,8 @@ local function serializeValue(val, visited, depth)
 end
 
 local function buildReplayCode()
-    if type(cfg.LoaderUrl) ~= "string" or cfg.LoaderUrl == "" then
+    local targetUrl = (type(cfg.QueueUrl) == "string" and cfg.QueueUrl ~= "" and cfg.QueueUrl) or cfg.LoaderUrl
+    if type(targetUrl) ~= "string" or targetUrl == "" then
         return nil
     end
 
@@ -616,6 +618,9 @@ local function buildReplayCode()
     persistedLoaderCfg.Preset = cfg.Preset
     persistedLoaderCfg.BaseUrl = cfg.BaseUrl
     persistedLoaderCfg.LoaderUrl = cfg.LoaderUrl
+    if cfg.QueueUrl ~= nil then
+        persistedLoaderCfg.QueueUrl = cfg.QueueUrl
+    end
 
     -- Preserve explicit sub-module overrides across teleports if present
     local optUser = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
@@ -649,7 +654,7 @@ local function buildReplayCode()
         end
     end
 
-    table.insert(chunks, "loadstring(game:HttpGet(" .. quoteString(cfg.LoaderUrl) .. ",true))()")
+    table.insert(chunks, "loadstring(game:HttpGet(" .. quoteString(targetUrl) .. ",true))()")
     return table.concat(chunks, "")
 end
 
