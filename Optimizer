@@ -56,6 +56,7 @@ local DEFAULT_SETTINGS = {
         ["Optimize Physics"] = true,
         ["Physics Throttle"] = "Auto",
         ["Optimize Network"] = true,
+        ["Mute Sounds"] = false,
         ["Apply FFlags"] = false, -- Opt-in only: runtime setfflag hooks can destabilize some clients/executors
         ["Disable 3D Rendering"] = false,
         ["FPS Cap"] = false,
@@ -349,6 +350,7 @@ local disableWorldUI = type(optimizeWorldUI) == "string"
 local optimizePhysics = otherCfg["Optimize Physics"] == true
 local physicsThrottle = otherCfg["Physics Throttle"]
 local optimizeNetwork = otherCfg["Optimize Network"] == true
+local muteSounds = otherCfg["Mute Sounds"] == true
 local applyFFlags = otherCfg["Apply FFlags"] == true
 local disable3DRendering = otherCfg["Disable 3D Rendering"] == true
 local fpsCap = otherCfg["FPS Cap"]
@@ -631,6 +633,24 @@ local function handleVideoFrame(inst)
     end
 end
 
+local function handleSound(inst)
+    if not muteSounds then
+        return
+    end
+    local okVol, vol = pcall(function()
+        return inst.Volume
+    end)
+    if okVol and type(vol) == "number" and vol ~= 0 then
+        setPropSafe(inst, "Volume", 0)
+    end
+    local okPlay, playing = pcall(function()
+        return inst.Playing
+    end)
+    if okPlay and playing == true then
+        setPropSafe(inst, "Playing", false)
+    end
+end
+
 local function handleWorldUI(inst)
     if disableWorldUI then
         if inst.Enabled then
@@ -700,6 +720,8 @@ local CLASS_HANDLERS = {
     SurfaceAppearance = handleSurfaceAppearance,
     Highlight = handleHighlight,
     VideoFrame = handleVideoFrame,
+    Sound = handleSound,
+    SoundGroup = handleSound,
     BillboardGui = handleWorldUI,
     SurfaceGui = handleWorldUI,
 
@@ -750,8 +772,8 @@ local SKIP_CLASSES = {
     RemoteFunction = true,
     BindableEvent = true,
     BindableFunction = true,
-    Sound = true,
-    SoundGroup = true,
+    Sound = not muteSounds,
+    SoundGroup = not muteSounds,
     ClickDetector = true,
     ProximityPrompt = true,
     Humanoid = true,
@@ -852,6 +874,13 @@ local function resolveHandler(inst, className)
     elseif inst:IsA("VideoFrame") then
         CLASS_HANDLERS[className] = handleVideoFrame
         return handleVideoFrame
+    elseif inst:IsA("Sound") or inst:IsA("SoundGroup") then
+        if muteSounds then
+            CLASS_HANDLERS[className] = handleSound
+            return handleSound
+        end
+        SKIP_CLASSES[className] = true
+        return nil
     end
 
     SKIP_CLASSES[className] = true
@@ -979,6 +1008,15 @@ local function applyGlobalSettings()
         end)
         applyFFlag("FFlagOptimizeNetworkTransport", "True")
         applyFFlag("DFIntConnectionMTUSize", 1400)
+    end
+
+    if muteSounds then
+        pcall(function()
+            local gs = UserSettings():GetService("UserGameSettings")
+            if gs then
+                pcall(setPropSafe, gs, "MasterVolume", 0)
+            end
+        end)
     end
 
     if fpsCap then

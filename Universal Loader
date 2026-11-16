@@ -12,6 +12,11 @@ local DEFAULT_SETTINGS = {
     ExtraCode = nil,
     AFKToggleKey = nil, -- e.g. "F8" or Enum.KeyCode.F8
     AFKDarkScreen = true, -- show dark overlay instead of Roblox's white 3D-disabled screen
+    AFKOverlayTimer = true, -- show live elapsed timer on dark overlay while AFK mode is active
+    AFKFPSCap = 15, -- FPS cap applied during AFK mode / unfocus pause
+    AutoAFKOnUnfocus = true, -- pause 3D rendering & cap FPS on Alt-Tab / window unfocus, restore on return
+    MuteSoundsOnAFK = true, -- mute MasterVolume while AFK mode is active and restore on exit
+    MuteAllSounds = false, -- permanently silence game sounds via Optimizer ("Mute Sounds")
     StagedExecution = true, -- stagger module loads instead of slamming frame 0
     AntiAFKDelay = 2, -- seconds after execute before Anti-AFK loads
     OptimizerDelay = 3, -- seconds after Anti-AFK before Optimizer loads
@@ -68,6 +73,8 @@ end
 
 local env = safeEnv()
 
+local hasRealSpawn = (type(task) == "table" and type(task.spawn) == "function")
+    or (type(spawn) == "function")
 local waitTask = (type(task) == "table" and type(task.wait) == "function" and task.wait) or wait or function() end
 local spawnTask = (type(task) == "table" and type(task.spawn) == "function" and task.spawn)
     or (type(spawn) == "function" and spawn)
@@ -94,14 +101,28 @@ local state = {
     runId = runId,
     active = true,
     afkRenderDisabled = false,
+    manualAfk = false,
+    focusAfk = false,
     afkToggledManually = false,
+    afkStartedAt = nil,
+    afkKeyLabel = nil,
+    afkStatusLabel = nil,
     afkOverlay = nil,
+    overlayThread = nil,
     stageThread = nil,
+    savedMasterVolume = nil,
     connections = {},
 }
 
 function state.cleanup()
     state.active = false
+    if state.overlayThread then
+        local ot = state.overlayThread
+        state.overlayThread = nil
+        if cancelTask then
+            pcall(cancelTask, ot)
+        end
+    end
     if state.stageThread then
         local st = state.stageThread
         state.stageThread = nil
@@ -109,6 +130,18 @@ function state.cleanup()
             pcall(cancelTask, st)
         end
     end
+    if state.savedMasterVolume ~= nil and type(UserSettings) == "function" then
+        local prevVol = state.savedMasterVolume
+        state.savedMasterVolume = nil
+        pcall(function()
+            local gs = UserSettings():GetService("UserGameSettings")
+            if gs then
+                gs.MasterVolume = prevVol
+            end
+        end)
+    end
+    state.afkStatusLabel = nil
+    state.afkStartedAt = nil
     if state.afkOverlay then
         local overlay = state.afkOverlay
         state.afkOverlay = nil
@@ -226,6 +259,11 @@ local cfg = mergeTables(DEFAULT_SETTINGS, userLoaderCfg)
 if type(cfg.ExtraScripts) ~= "table" then
     cfg.ExtraScripts = {}
 end
+cfg.AFKOverlayTimer = cfg.AFKOverlayTimer ~= false
+cfg.AFKFPSCap = math.max(1, math.floor(tonumber(cfg.AFKFPSCap) or DEFAULT_SETTINGS.AFKFPSCap))
+cfg.AutoAFKOnUnfocus = cfg.AutoAFKOnUnfocus ~= false
+cfg.MuteSoundsOnAFK = cfg.MuteSoundsOnAFK ~= false
+cfg.MuteAllSounds = cfg.MuteAllSounds == true
 cfg.StagedExecution = cfg.StagedExecution ~= false
 cfg.AntiAFKDelay = math.max(0, tonumber(cfg.AntiAFKDelay) or DEFAULT_SETTINGS.AntiAFKDelay)
 cfg.OptimizerDelay = math.max(0, tonumber(cfg.OptimizerDelay) or DEFAULT_SETTINGS.OptimizerDelay)
@@ -550,7 +588,7 @@ local function armTeleportQueueOnce()
     return false
 end
 
--- Resolve initial preset & FPS cap metadata before attaching live AFK hotkey
+-- Resolve initial preset & FPS cap metadata before attaching live AFK controls
 local presetKey = string.lower(tostring(cfg.Preset or "balanced"))
 local presetBase = PRESET_OPTIMIZER_OVERRIDES[presetKey] or PRESET_OPTIMIZER_OVERRIDES.balanced
 local initialUserOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
@@ -559,17 +597,70 @@ if initialUserOpt then
     initialOpt = mergeTables(initialOpt, initialUserOpt)
 end
 
-state.afkRenderDisabled = (initialOpt.Other and initialOpt.Other["Disable 3D Rendering"] == true)
+state.manualAfk = (initialOpt.Other and initialOpt.Other["Disable 3D Rendering"] == true)
     or ((initialOpt.Other and initialOpt.Other["Disable 3D Rendering"] == nil)
         and (presetBase.Other and presetBase.Other["Disable 3D Rendering"] == true))
     or false
+state.afkRenderDisabled = state.manualAfk
 
 local restoredCap = tonumber(initialOpt.Other and initialOpt.Other["FPS Cap"]) or 999
-if (state.afkRenderDisabled and restoredCap == 15) or restoredCap <= 0 then
+if (state.manualAfk and (restoredCap == cfg.AFKFPSCap or restoredCap == 15)) or restoredCap <= 0 then
     restoredCap = 999
 end
 
--- Live AFK toggle hotkey & overlay helpers (toggles 3D rendering and FPS cap safely)
+local function clockNow()
+    if type(os) == "table" then
+        if type(os.clock) == "function" then
+            return os.clock()
+        elseif type(os.time) == "function" then
+            return os.time()
+        end
+    end
+    return 0
+end
+
+local function getUserGameSettings()
+    if type(UserSettings) ~= "function" then
+        return nil
+    end
+    local ok, gs = pcall(function()
+        return UserSettings():GetService("UserGameSettings")
+    end)
+    return (ok and gs) or nil
+end
+
+local function syncAfkAudio(shouldMute)
+    if not cfg.MuteSoundsOnAFK then
+        return
+    end
+    local gs = getUserGameSettings()
+    if not gs then
+        return
+    end
+    if shouldMute then
+        if state.savedMasterVolume == nil then
+            local okVol, curVol = pcall(function()
+                return gs.MasterVolume
+            end)
+            if okVol and type(curVol) == "number" then
+                state.savedMasterVolume = curVol
+            end
+        end
+        pcall(function()
+            gs.MasterVolume = 0
+        end)
+    elseif state.savedMasterVolume ~= nil then
+        local prevVol = state.savedMasterVolume
+        state.savedMasterVolume = nil
+        if not cfg.MuteAllSounds then
+            pcall(function()
+                gs.MasterVolume = prevVol
+            end)
+        end
+    end
+end
+
+-- Live AFK hotkey, focus-loss pause & overlay helpers
 local function resolveKeyCode(keySpec)
     if not Enum or not Enum.KeyCode or keySpec == nil or keySpec == false then
         return nil
@@ -589,7 +680,72 @@ local function resolveKeyCode(keySpec)
 end
 
 local toggleKey = resolveKeyCode(cfg.AFKToggleKey)
+if toggleKey then
+    local okKeyName, kName = pcall(function()
+        return toggleKey.Name
+    end)
+    if okKeyName and type(kName) == "string" and kName ~= "" then
+        state.afkKeyLabel = kName
+    end
+end
+
 local OVERLAY_NAME = "__UniversalLoaderAFKOverlay"
+
+local function formatOverlayText(elapsedSec)
+    local total = math.max(0, math.floor(elapsedSec or 0))
+    local hrs = math.floor(total / 3600)
+    local mins = math.floor((total % 3600) / 60)
+    local secs = total % 60
+    local timerPart = cfg.AFKOverlayTimer and string.format("  |  %02d:%02d:%02d", hrs, mins, secs) or ""
+
+    if state.afkKeyLabel then
+        return string.format("AFK Mode Active (%d FPS)%s\nPress %s to restore 3D view", cfg.AFKFPSCap, timerPart, state.afkKeyLabel)
+    end
+    if cfg.AFKOverlayTimer then
+        return string.format("AFK Mode Active (%d FPS)%s", cfg.AFKFPSCap, timerPart)
+    end
+    return "AFK Mode Active (3D Rendering Paused)"
+end
+
+local function updateOverlayStatusLabel()
+    local lbl = state.afkStatusLabel
+    if not lbl then
+        return
+    end
+    local elapsed = state.afkStartedAt and (clockNow() - state.afkStartedAt) or 0
+    pcall(function()
+        lbl.Text = formatOverlayText(elapsed)
+    end)
+end
+
+local function stopOverlayTimer()
+    if state.overlayThread then
+        local ot = state.overlayThread
+        state.overlayThread = nil
+        if cancelTask then
+            pcall(cancelTask, ot)
+        end
+    end
+    state.afkStartedAt = nil
+end
+
+local function startOverlayTimer()
+    state.afkStartedAt = state.afkStartedAt or clockNow()
+    updateOverlayStatusLabel()
+    if not cfg.AFKOverlayTimer or not hasRealSpawn or state.overlayThread then
+        return
+    end
+    state.overlayThread = spawnTask(function()
+        while isActive() and state.afkRenderDisabled and state.afkOverlay do
+            waitTask(1)
+            if not isActive() or not state.afkRenderDisabled or not state.afkOverlay then
+                break
+            end
+            updateOverlayStatusLabel()
+        end
+        state.overlayThread = nil
+    end)
+end
 
 local function destroyExistingOverlay(parent)
     if not parent or type(parent.FindFirstChild) ~= "function" then
@@ -647,12 +803,12 @@ local function attachOverlayParent(gui, candidate, displayOrder)
     return ok and gui.Parent == candidate
 end
 
-local function createDarkOverlay(keyObj)
+local function createDarkOverlay()
     local okInst, instLib = pcall(function()
         return Instance
     end)
     if not okInst or not instLib or type(instLib.new) ~= "function" then
-        return nil
+        return nil, nil
     end
 
     local allowHui = (env.__UniversalLoaderUsedHui == true)
@@ -660,6 +816,7 @@ local function createDarkOverlay(keyObj)
     clearAllOverlays(coreGui, hiddenUi, playerGui)
 
     local gui = nil
+    local statusLabel = nil
     local okCreate = pcall(function()
         gui = instLib.new("ScreenGui")
         gui.Name = OVERLAY_NAME
@@ -692,19 +849,7 @@ local function createDarkOverlay(keyObj)
         label.BackgroundTransparency = 1
         label.TextWrapped = true
         label.TextSize = 16
-
-        local keyLabel = nil
-        if keyObj then
-            local okKeyName, kName = pcall(function()
-                return keyObj.Name
-            end)
-            if okKeyName and type(kName) == "string" and kName ~= "" then
-                keyLabel = kName
-            end
-        end
-        label.Text = keyLabel
-            and string.format("AFK Mode Active (15 FPS)\nPress %s to restore 3D view", keyLabel)
-            or "AFK Mode Active (3D Rendering Paused)"
+        label.Text = formatOverlayText(0)
 
         pcall(function()
             if Color3 and type(Color3.fromRGB) == "function" then
@@ -715,10 +860,11 @@ local function createDarkOverlay(keyObj)
             end
         end)
         label.Parent = backdrop
+        statusLabel = label
     end)
 
     if not okCreate or not gui then
-        return nil
+        return nil, nil
     end
 
     local attached = attachOverlayParent(gui, coreGui, -10)
@@ -741,13 +887,14 @@ local function createDarkOverlay(keyObj)
         pcall(function()
             gui:Destroy()
         end)
-        return nil
+        return nil, nil
     end
-    return gui
+    return gui, statusLabel
 end
 
 local function syncAfkDarkOverlay(enabled)
     if not cfg.AFKDarkScreen or not enabled then
+        stopOverlayTimer()
         if state.afkOverlay then
             pcall(function()
                 state.afkOverlay.Enabled = false
@@ -761,41 +908,83 @@ local function syncAfkDarkOverlay(enabled)
     end
 
     if not state.afkOverlay or not state.afkOverlay.Parent then
-        state.afkOverlay = createDarkOverlay(toggleKey)
+        state.afkOverlay, state.afkStatusLabel = createDarkOverlay()
     end
     if state.afkOverlay then
         pcall(function()
             state.afkOverlay.Enabled = true
         end)
+        startOverlayTimer()
     end
 end
 
--- Arm teleport replay and live F8 AFK hotkey immediately before staged module execution
+local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
+
+local function applyAfkMode(reasonText)
+    local shouldAfk = state.manualAfk or state.focusAfk
+    state.afkRenderDisabled = shouldAfk
+    if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
+        pcall(RunService.Set3dRenderingEnabled, RunService, not shouldAfk)
+    end
+    if setFpsCapFn then
+        pcall(setFpsCapFn, shouldAfk and cfg.AFKFPSCap or restoredCap)
+    end
+    syncAfkAudio(shouldAfk)
+    syncAfkDarkOverlay(shouldAfk)
+    if reasonText then
+        notify("Universal Loader", reasonText)
+    end
+end
+
+-- Arm teleport replay, initial AFK overlay/audio, F8 hotkey & Alt-Tab focus listener immediately
 local queueArmed = armTeleportQueueOnce()
+if state.manualAfk then
+    syncAfkAudio(true)
+end
 syncAfkDarkOverlay(state.afkRenderDisabled)
 
-if toggleKey and UserInputService and UserInputService.InputBegan then
-    local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
-    trackConnection(UserInputService.InputBegan, function(input, gameProcessed)
-        if not isActive() or gameProcessed or not input then
-            return
-        end
-        if input.KeyCode == toggleKey then
-            state.afkRenderDisabled = not state.afkRenderDisabled
-            state.afkToggledManually = true
-            if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
-                pcall(RunService.Set3dRenderingEnabled, RunService, not state.afkRenderDisabled)
+if UserInputService then
+    if toggleKey and UserInputService.InputBegan then
+        trackConnection(UserInputService.InputBegan, function(input, gameProcessed)
+            if not isActive() or gameProcessed or not input then
+                return
             end
-            if setFpsCapFn then
-                pcall(setFpsCapFn, state.afkRenderDisabled and 15 or restoredCap)
+            if input.KeyCode == toggleKey then
+                state.manualAfk = not state.manualAfk
+                state.afkToggledManually = true
+                applyAfkMode(
+                    (state.manualAfk or state.focusAfk)
+                        and "AFK mode ON (3D rendering paused)"
+                        or "AFK mode OFF (3D rendering restored)"
+                )
             end
-            syncAfkDarkOverlay(state.afkRenderDisabled)
-            notify(
-                "Universal Loader",
-                state.afkRenderDisabled and "AFK mode ON (3D rendering paused)" or "AFK mode OFF (3D rendering restored)"
-            )
+        end)
+    end
+
+    if cfg.AutoAFKOnUnfocus then
+        if UserInputService.WindowFocusReleased then
+            trackConnection(UserInputService.WindowFocusReleased, function()
+                if not isActive() or state.focusAfk then
+                    return
+                end
+                state.focusAfk = true
+                if not state.manualAfk then
+                    applyAfkMode()
+                end
+            end)
         end
-    end)
+        if UserInputService.WindowFocused then
+            trackConnection(UserInputService.WindowFocused, function()
+                if not isActive() or not state.focusAfk then
+                    return
+                end
+                state.focusAfk = false
+                if not state.manualAfk then
+                    applyAfkMode()
+                end
+            end)
+        end
+    end
 end
 
 local function waitStage(seconds)
@@ -828,7 +1017,7 @@ local function runModulesPipeline()
         return
     end
 
-    -- 2. Optimizer (runs after Anti-AFK settles, respecting any live AFK toggle made in the meantime)
+    -- 2. Optimizer (runs after Anti-AFK settles, respecting live F8 / Alt-Tab AFK state and MuteAllSounds)
     if cfg.LoadOptimizer and waitStage(cfg.OptimizerDelay) then
         local userOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
         local finalOpt = mergeTables(presetBase, cfg.OptimizerSettings)
@@ -837,20 +1026,25 @@ local function runModulesPipeline()
         end
         finalOpt.Other = finalOpt.Other or {}
 
+        if cfg.MuteAllSounds then
+            finalOpt.Other["Mute Sounds"] = true
+        end
+
         local explicitCap = tonumber(finalOpt.Other["FPS Cap"])
-        if explicitCap and explicitCap > 0 and not (state.afkRenderDisabled and explicitCap == 15) then
+        if explicitCap and explicitCap > 0 and not (state.afkRenderDisabled and (explicitCap == cfg.AFKFPSCap or explicitCap == 15)) then
             restoredCap = explicitCap
         end
 
-        if state.afkToggledManually then
+        if state.afkToggledManually or state.focusAfk then
             finalOpt.Other["Disable 3D Rendering"] = state.afkRenderDisabled
             if state.afkRenderDisabled then
-                finalOpt.Other["FPS Cap"] = 15
+                finalOpt.Other["FPS Cap"] = cfg.AFKFPSCap
             else
                 finalOpt.Other["FPS Cap"] = (restoredCap ~= 999) and restoredCap or false
             end
         elseif finalOpt.Other["Disable 3D Rendering"] ~= nil then
-            state.afkRenderDisabled = finalOpt.Other["Disable 3D Rendering"] == true
+            state.manualAfk = finalOpt.Other["Disable 3D Rendering"] == true
+            state.afkRenderDisabled = state.manualAfk
         end
 
         writeConfigSlot("Settings", finalOpt)
