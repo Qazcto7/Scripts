@@ -2,6 +2,13 @@ local env = (type(getgenv) == "function" and getgenv()) or _G
 if type(env.__LiftingSimState) == "table" and type(env.__LiftingSimState.cleanup) == "function" then
     pcall(env.__LiftingSimState.cleanup)
 end
+if type(env.__LiftingSimLibrary) == "table" and type(env.__LiftingSimLibrary.Destroy) == "function" then
+    pcall(function()
+        env.__LiftingSimLibrary:Destroy()
+    end)
+    env.__LiftingSimLibrary = nil
+end
+env.__UniversalLoaderTeleporting = nil
 
 local lsState = {
     active = true,
@@ -13,6 +20,10 @@ env.__LiftingSimState = lsState
 
 local function isActive()
     return lsState.active and env.__LiftingSimState == lsState
+end
+
+local function isFarmPaused()
+    return env.__UniversalLoaderTeleporting == true
 end
 
 local filename = "LS.txt"
@@ -50,11 +61,22 @@ local function safeSpawn(fn)
     return co
 end
 
+local function safeDefer(fn)
+    if type(task) == "table" and type(task.defer) == "function" then
+        return task.defer(fn)
+    end
+    return safeSpawn(function()
+        safeWait()
+        fn()
+    end)
+end
+
 -- Initialize settings table with default values
 local settingsTable = {
     AutoLift = false,
     AutoLift1 = false,
     AutoSell = false,
+    ToolFarm = false,
 }
 
 -- Function to load settings from the file
@@ -124,10 +146,11 @@ local success, err = pcall(function()
     library = loadstring(game:HttpGet("https://raw.githubusercontent.com/Qazcto7/Scripts/refs/heads/main/Local%20Library", true))()
 end)
 
-if not success then
+if not success or not library then
     warn("Failed to load UI library: " .. tostring(err))
     return
 end
+env.__LiftingSimLibrary = library
 
 library.options.underlinecolor = "rainbow"
 
@@ -170,16 +193,16 @@ end)
 
 safeSpawn(function()
     while isActive() do
-        if w.flags.AutoLift then
+        if w.flags.AutoLift and not isFarmPaused() then
             local ev = getRemoteEvent()
             if ev then
                 pcall(function()
-                    for _ = 1, 5 do
+                    for _ = 1, 2 do
                         ev:FireServer({"GainMuscle"})
                     end
                 end)
             end
-            safeWait(0.05)
+            safeWait(0.08)
         else
             safeWait(0.15)
         end
@@ -194,7 +217,7 @@ end)
 
 safeSpawn(function()
     while isActive() do
-        if w.flags.AutoLift1 then
+        if w.flags.AutoLift1 and not isFarmPaused() then
             local ev = getRemoteEvent()
             if ev then
                 pcall(function()
@@ -218,76 +241,85 @@ end)
 
 safeSpawn(function()
     while isActive() do
-        if w.flags.AutoSell then
+        if w.flags.AutoSell and not isFarmPaused() then
             local ev = getRemoteEvent()
             if ev then
                 pcall(function()
                     ev:FireServer({"SellMuscle"})
                 end)
             end
-            safeWait(0.1)
+            safeWait(0.2)
         else
             safeWait(0.15)
         end
     end
 end)
 
--- Function to automatically equip the first tool in the backpack and activate it for farming
+-- Toggle for Tool Farm (replaces permanent one-way button; stops cleanly when unchecked)
+w:Toggle('Tool Farm', {flag = "ToolFarm", default = settingsTable.ToolFarm == true}, function(state)
+    settingsTable.ToolFarm = state
+    saveSettings()
+end)
+
+local NON_WEIGHT_PATTERNS = { "punch", "fist", "kick", "stomp", "slash", "blood", "wolf", "spartan", "rage", "skill" }
+
+local function pickWeightTool(backpack)
+    if not backpack then
+        return nil
+    end
+    local fallback = nil
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") then
+            fallback = fallback or item
+            local lowerName = string.lower(tostring(item.Name or ""))
+            local isSkill = false
+            for _, pat in ipairs(NON_WEIGHT_PATTERNS) do
+                if string.find(lowerName, pat, 1, true) then
+                    isSkill = true
+                    break
+                end
+            end
+            if not isSkill then
+                return item
+            end
+        end
+    end
+    return fallback
+end
+
+-- Equip Weight tool & activate ONLY while Auto Lift, Auto Lift x100, or Tool Farm is enabled
 local function equipAndFarm()
     local player = Players.LocalPlayer
     while isActive() do
-        safeWait(0.05)
-        if not isActive() then
-            break
-        end
-        pcall(function()
-            player = player or Players.LocalPlayer
-            if player and player.Character then
-                local toolEquipped = player.Character:FindFirstChildOfClass("Tool")
-                if not toolEquipped then
-                    local backpack = player:FindFirstChildOfClass("Backpack") or player.Backpack
-                    if backpack then
-                        for _, item in ipairs(backpack:GetChildren()) do
-                            if item:IsA("Tool") then
-                                item.Parent = player.Character
-                                break
-                            end
+        local farmingActive = (w.flags.AutoLift == true or w.flags.AutoLift1 == true or w.flags.ToolFarm == true)
+            and not isFarmPaused()
+        if not farmingActive then
+            safeWait(0.15)
+        else
+            pcall(function()
+                player = player or Players.LocalPlayer
+                if player and player.Character then
+                    local toolEquipped = player.Character:FindFirstChildOfClass("Tool")
+                    if not toolEquipped then
+                        local backpack = player:FindFirstChildOfClass("Backpack") or player.Backpack
+                        local weightTool = pickWeightTool(backpack)
+                        if weightTool then
+                            weightTool.Parent = player.Character
                         end
                     end
-                end
 
-                local activeTool = player.Character:FindFirstChildOfClass("Tool")
-                if activeTool then
-                    activeTool:Activate()
+                    local activeTool = player.Character:FindFirstChildOfClass("Tool")
+                    if activeTool then
+                        activeTool:Activate()
+                    end
                 end
-            end
-        end)
+            end)
+            safeWait(0.08)
+        end
     end
 end
 
 safeSpawn(equipAndFarm)
-
--- Tool Farm Functionality (guarded against duplicate loops on repeated clicks)
-local toolFarmRunning = false
-w:Button("Tool Farm", function()
-    if toolFarmRunning or not isActive() then
-        return
-    end
-    toolFarmRunning = true
-    safeSpawn(function()
-        while toolFarmRunning and isActive() do
-            pcall(function()
-                local player = Players.LocalPlayer
-                local char = player and player.Character
-                local tool = char and char:FindFirstChildOfClass("Tool")
-                if tool then
-                    tool:Activate()
-                end
-            end)
-            safeWait(0.05)
-        end
-    end)
-end)
 
 -- Universal Controls (Universal Loader API & Panel)
 w:Section('Universal')
@@ -295,7 +327,7 @@ w:Section('Universal')
 w:Dropdown('Preset', {flag = "UniversalPreset", list = {"MaxFPS", "Balanced", "AFK"}}, function(preset)
     local api = getUniversal()
     if api then
-        safeSpawn(function()
+        safeDefer(function()
             api:SetPreset(preset)
         end)
     end
@@ -318,7 +350,7 @@ end)
 w:Button('Rejoin Server', function()
     local api = getUniversal()
     if api then
-        safeSpawn(function()
+        safeDefer(function()
             api:Rejoin()
         end)
     end
@@ -327,15 +359,15 @@ end)
 w:Button('Low-Player Server Hop', function()
     local api = getUniversal()
     if api then
-        safeSpawn(function()
+        safeDefer(function()
             api:ServerHop(true)
         end)
     end
 end)
 
 w:Section('F8 = AFK | F7 = Mini Panel')
+w:Section('Turn off Auto Sell to grow big')
 w:Section('Auto lift x100 increase ping')
-w:Section('Equip Weight to use "Tool Farm"')
 w:Section('Right Ctrl to hide')
 
 print("Script loaded successfully!")

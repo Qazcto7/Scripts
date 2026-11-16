@@ -91,6 +91,14 @@ local spawnTask = (type(task) == "table" and type(task.spawn) == "function" and 
     end)
     or nil
 local cancelTask = (type(task) == "table" and type(task.cancel) == "function" and task.cancel) or nil
+local deferTask = (type(task) == "table" and type(task.defer) == "function" and task.defer)
+    or (hasRealSpawn and spawnTask and function(fn)
+        return spawnTask(function()
+            waitTask()
+            fn()
+        end)
+    end)
+    or spawnTask
 local compileLua = loadstring or load
 
 local runId = (tonumber(env.__UniversalLoaderRunId) or 0) + 1
@@ -140,6 +148,7 @@ function state.cleanup()
     state.rejoinBtn = nil
     state.hopBtn = nil
     state.lowHopBtn = nil
+    env.__UniversalLoaderTeleporting = nil
     if env.__UniversalLoaderHoppingUntil ~= nil then
         env.__UniversalLoaderHoppingUntil = nil
     end
@@ -411,8 +420,9 @@ local function getQueueOnTeleportFn()
     )
 end
 
-local function fetchUrl(url, preferRequestFirst)
+local function fetchUrl(url, preferRequestFirst, maxAttempts)
     local reqFn = getRequestFn()
+    local attempts = math.max(1, tonumber(maxAttempts) or cfg.RetryHttpAttempts)
     local function tryHttpGet()
         if game and type(game.HttpGet) == "function" then
             local ok, body = pcall(function()
@@ -430,7 +440,6 @@ local function fetchUrl(url, preferRequestFirst)
             local ok, res = pcall(reqFn, {
                 Url = url,
                 Method = "GET",
-                Headers = preferRequestFirst and { Accept = "application/json" } or nil,
             })
             if ok and type(res) == "table" then
                 local status = tonumber(res.StatusCode)
@@ -448,7 +457,7 @@ local function fetchUrl(url, preferRequestFirst)
         return nil, nil, nil
     end
 
-    for attempt = 1, cfg.RetryHttpAttempts do
+    for attempt = 1, attempts do
         if not isActive() then
             return nil, "inactive", nil
         end
@@ -480,7 +489,7 @@ local function fetchUrl(url, preferRequestFirst)
             end
         end
 
-        if attempt < cfg.RetryHttpAttempts then
+        if attempt < attempts then
             waitTask(0.5)
         end
     end
@@ -1320,8 +1329,8 @@ local function createControlPanel()
                     if not isActive() then
                         return
                     end
-                    if isAsync and spawnTask then
-                        spawnTask(function()
+                    if isAsync and deferTask then
+                        deferTask(function()
                             if isActive() then
                                 pcall(onClick)
                             end
@@ -1502,6 +1511,7 @@ end
 
 local function scheduleTeleportUnlock(delaySec, btn, failText)
     state.teleportBusy = false
+    env.__UniversalLoaderTeleporting = nil
     if env.__UniversalLoaderHoppingUntil and clockNow() >= (tonumber(env.__UniversalLoaderHoppingUntil) or 0) then
         env.__UniversalLoaderHoppingUntil = nil
     end
@@ -1518,6 +1528,31 @@ local function scheduleTeleportUnlock(delaySec, btn, failText)
         end
     end
     refreshControlPanel()
+end
+
+local function prepareForTeleport()
+    env.__UniversalLoaderTeleporting = true
+    if state.afkRenderDisabled or state.focusAfk then
+        state.manualAfk = false
+        state.focusAfk = false
+        state.afkRenderDisabled = false
+        if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
+            pcall(RunService.Set3dRenderingEnabled, RunService, true)
+        end
+        syncAfkDarkOverlay(false)
+    end
+    if type(env.__OptimizerState) == "table" and type(env.__OptimizerState.cleanup) == "function" then
+        pcall(env.__OptimizerState.cleanup)
+    end
+    if type(env.__AntiAFKState) == "table" and type(env.__AntiAFKState.cleanup) == "function" then
+        pcall(env.__AntiAFKState.cleanup)
+    end
+    if type(env.__AutoReconnectState) == "table" and type(env.__AutoReconnectState.cleanup) == "function" then
+        pcall(env.__AutoReconnectState.cleanup)
+    end
+    if hasRealSpawn then
+        waitTask(0.1)
+    end
 end
 
 function api.Rejoin(first, second)
@@ -1542,6 +1577,7 @@ function api.Rejoin(first, second)
     setBtnLabel(state.rejoinBtn, "Rejoining...")
 
     armTeleportQueueOnce()
+    prepareForTeleport()
 
     local jobId = game and game.JobId
     local okTp, errTp
@@ -1561,11 +1597,13 @@ function api.Rejoin(first, second)
                 waitTask(8)
                 if isActive() and state.teleportBusy then
                     state.teleportBusy = false
+                    env.__UniversalLoaderTeleporting = nil
                     refreshControlPanel()
                 end
             end)
         else
             state.teleportBusy = false
+            env.__UniversalLoaderTeleporting = nil
         end
         return true
     end
@@ -1601,14 +1639,14 @@ function api.ServerHop(first, second)
 
     local sortOrder = preferLowPlayer and "Asc" or "Desc"
     local baseApiUrl = string.format(
-        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100",
+        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=25",
         math.floor(placeId),
         sortOrder
     )
 
-    local body, fetchErr, httpStatus = fetchUrl(baseApiUrl .. "&excludeFullGames=true", true)
+    local body, fetchErr, httpStatus = fetchUrl(baseApiUrl .. "&excludeFullGames=true", true, 1)
     if not body and httpStatus ~= 429 and httpStatus ~= 403 then
-        body, fetchErr, httpStatus = fetchUrl(baseApiUrl, true)
+        body, fetchErr, httpStatus = fetchUrl(baseApiUrl, true, 1)
     end
     if not body then
         local failLabel = (httpStatus == 429) and "Rate Limited" or "Fetch Failed"
@@ -1654,87 +1692,68 @@ function api.ServerHop(first, second)
 
     armTeleportQueueOnce()
 
-    local initFailed = false
-    local initFailedNonRetry = false
     local failConn = nil
     if hasRealSpawn and TeleportService.TeleportInitFailed then
         local okSig, conn = pcall(function()
             return TeleportService.TeleportInitFailed:Connect(function(plr, tpResult)
-                if plr ~= LocalPlayer then
+                if plr ~= LocalPlayer or not isActive() then
                     return
                 end
                 if Enum and Enum.TeleportResult and tpResult == Enum.TeleportResult.IsTeleporting then
-                    initFailedNonRetry = true
-                else
-                    initFailed = true
+                    return
                 end
+                if failConn then
+                    pcall(function() failConn:Disconnect() end)
+                    failConn = nil
+                end
+                env.__UniversalLoaderHoppingUntil = nil
+                scheduleTeleportUnlock(2, activeBtn, "Hop Failed")
             end)
         end)
         if okSig and conn then
             failConn = conn
+            table.insert(state.connections, conn)
         end
     end
 
-    local maxTries = math.min(#candidates, 3)
-    local lastErr = "Teleport failed"
-    for idx = 1, maxTries do
-        if not isActive() then
-            break
-        end
-        local chosen = candidates[idx]
-        initFailed = false
-        initFailedNonRetry = false
-        setBtnLabel(activeBtn, string.format("Joining (%dp)...", tonumber(chosen.playing) or 0))
+    local chosen = candidates[1]
+    setBtnLabel(activeBtn, string.format("Joining (%dp)...", tonumber(chosen.playing) or 0))
+    prepareForTeleport()
 
-        local okHop, errHop = pcall(function()
-            TeleportService:TeleportToPlaceInstance(placeId, chosen.id, LocalPlayer)
-        end)
+    local okHop, errHop = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, chosen.id, LocalPlayer)
+    end)
 
-        if okHop then
-            if hasRealSpawn then
-                local waited = 0
-                while isActive() and waited < 2.0 and not initFailed and not initFailedNonRetry do
-                    waitTask(0.25)
-                    waited = waited + 0.25
-                end
-                if not initFailed then
+    if okHop then
+        if hasRealSpawn and spawnTask then
+            spawnTask(function()
+                waitTask(8)
+                if isActive() and state.teleportBusy then
                     if failConn then
                         pcall(function() failConn:Disconnect() end)
                         failConn = nil
                     end
-                    if spawnTask then
-                        spawnTask(function()
-                            waitTask(6)
-                            if isActive() and state.teleportBusy then
-                                state.teleportBusy = false
-                                env.__UniversalLoaderHoppingUntil = nil
-                                refreshControlPanel()
-                            end
-                        end)
-                    else
-                        state.teleportBusy = false
-                    end
-                    return true, chosen.id
+                    env.__UniversalLoaderHoppingUntil = nil
+                    scheduleTeleportUnlock(0, activeBtn, nil)
                 end
-                lastErr = "Server rejected teleport"
-            else
-                if failConn then
-                    pcall(function() failConn:Disconnect() end)
-                end
-                state.teleportBusy = false
-                env.__UniversalLoaderHoppingUntil = nil
-                return true, chosen.id
-            end
+            end)
         else
-            lastErr = tostring(errHop)
+            if failConn then
+                pcall(function() failConn:Disconnect() end)
+            end
+            state.teleportBusy = false
+            env.__UniversalLoaderTeleporting = nil
+            env.__UniversalLoaderHoppingUntil = nil
         end
+        return true, chosen.id
     end
 
     if failConn then
         pcall(function() failConn:Disconnect() end)
     end
+    env.__UniversalLoaderHoppingUntil = nil
     scheduleTeleportUnlock(2, activeBtn, "Hop Failed")
-    return false, lastErr
+    return false, tostring(errHop)
 end
 
 function api.IsPanelVisible()

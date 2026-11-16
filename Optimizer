@@ -976,7 +976,6 @@ local function applyGlobalSettings()
             if LOW_MESH_DETAIL then
                 pcall(setPropSafe, rs, "MeshPartDetailLevel", LOW_MESH_DETAIL)
             end
-            pcall(setPropSafe, rs, "EagerBulkExecution", false)
         end)
         pcall(function()
             local gs = UserSettings():GetService("UserGameSettings")
