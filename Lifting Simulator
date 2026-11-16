@@ -72,16 +72,16 @@ end
 -- Load settings when the script starts
 loadSettings()
 
--- Anti-AFK + Optimizer (MaxFPS + F8 AFK + Alt-Tab AFK) + Auto-Reconnect + Kontrol API & Mini Panel
+-- Anti-AFK + Optimizer (MaxFPS + F8 AFK + Unfocus AFK) + Auto-Reconnect + Control API & Mini Panel
 _G.UniversalLoaderSettings = {
     Preset = "MaxFPS",                -- "MaxFPS" | "AFK" | "Balanced"
-    AutoQueueOnTeleport = false,      -- true yaparsan teleport sonrası otomatik tekrar yükler
-    AFKToggleKey = Enum.KeyCode.F8,   -- F8 ile 3D Rendering kapalı / 15 FPS AFK modunu aç-kapat
-    PanelToggleKey = Enum.KeyCode.F7, -- F7 ile Universal mini kontrol panelini aç-kapat
-    ShowPanel = false,                -- true yaparsan açılışta mini panel otomatik gelir
-    AutoAFKOnUnfocus = true,          -- Alt-Tab yapınca otomatik AFK'ya geç, dönünce geri çık
-    AFKOverlayTimer = true,           -- Karanlık AFK ekranında canlı süre sayacı göster
-    MuteSoundsOnAFK = true,           -- AFK modundayken oyun seslerini otomatik kıs
+    AutoQueueOnTeleport = false,      -- set true to auto-reload after teleport / rejoin
+    AFKToggleKey = Enum.KeyCode.F8,   -- F8 toggles 3D Rendering pause / 15 FPS AFK mode
+    PanelToggleKey = Enum.KeyCode.F7, -- F7 toggles Universal mini control panel
+    ShowPanel = false,                -- set true to display mini panel on startup
+    AutoAFKOnUnfocus = true,          -- auto-enable AFK mode on Alt-Tab / focus loss, restore on return
+    AFKOverlayTimer = true,           -- show live elapsed timer on dark AFK overlay
+    MuteSoundsOnAFK = true,           -- mute game volume while AFK mode is active
 }
 
 local loaderApi = nil
@@ -274,7 +274,7 @@ w:Dropdown('Preset', {flag = "UniversalPreset", list = {"MaxFPS", "Balanced", "A
     end
 end)
 
-w:Button('AFK Ac / Kapat (F8)', function()
+w:Button('Toggle AFK (F8)', function()
     local api = getUniversal()
     if api then
         api:ToggleAFK()
@@ -295,7 +295,7 @@ w:Button('Rejoin Server', function()
     end
 end)
 
-w:Button('Az Kisili Server Hop', function()
+w:Button('Low-Player Server Hop', function()
     local api = getUniversal()
     if api then
         api:ServerHop(true)
