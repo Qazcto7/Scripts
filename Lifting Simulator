@@ -1,3 +1,20 @@
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if type(env.__LiftingSimState) == "table" and type(env.__LiftingSimState.cleanup) == "function" then
+    pcall(env.__LiftingSimState.cleanup)
+end
+
+local lsState = {
+    active = true,
+}
+lsState.cleanup = function()
+    lsState.active = false
+end
+env.__LiftingSimState = lsState
+
+local function isActive()
+    return lsState.active and env.__LiftingSimState == lsState
+end
+
 local filename = "LS.txt"
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
@@ -151,7 +168,7 @@ w:Toggle('Auto Lift', {flag = "AutoLift", default = settingsTable.AutoLift == tr
 end)
 
 safeSpawn(function()
-    while true do
+    while isActive() do
         if w.flags.AutoLift then
             local ev = getRemoteEvent()
             if ev then
@@ -161,8 +178,10 @@ safeSpawn(function()
                     end
                 end)
             end
+            safeWait(0.05)
+        else
+            safeWait(0.15)
         end
-        safeWait()
     end
 end)
 
@@ -173,7 +192,7 @@ w:Toggle('Auto Lift x100', {flag = "AutoLift1", default = settingsTable.AutoLift
 end)
 
 safeSpawn(function()
-    while true do
+    while isActive() do
         if w.flags.AutoLift1 then
             local ev = getRemoteEvent()
             if ev then
@@ -185,7 +204,7 @@ safeSpawn(function()
             end
             safeWait(0.3)
         else
-            safeWait()
+            safeWait(0.15)
         end
     end
 end)
@@ -197,7 +216,7 @@ w:Toggle('Auto Sell', {flag = "AutoSell", default = settingsTable.AutoSell == tr
 end)
 
 safeSpawn(function()
-    while true do
+    while isActive() do
         if w.flags.AutoSell then
             local ev = getRemoteEvent()
             if ev then
@@ -205,16 +224,21 @@ safeSpawn(function()
                     ev:FireServer({"SellMuscle"})
                 end)
             end
+            safeWait(0.1)
+        else
+            safeWait(0.15)
         end
-        safeWait()
     end
 end)
 
 -- Function to automatically equip the first tool in the backpack and activate it for farming
 local function equipAndFarm()
     local player = Players.LocalPlayer
-    while true do
-        safeWait()
+    while isActive() do
+        safeWait(0.05)
+        if not isActive() then
+            break
+        end
         pcall(function()
             player = player or Players.LocalPlayer
             if player and player.Character then
@@ -245,12 +269,12 @@ safeSpawn(equipAndFarm)
 -- Tool Farm Functionality (guarded against duplicate loops on repeated clicks)
 local toolFarmRunning = false
 w:Button("Tool Farm", function()
-    if toolFarmRunning then
+    if toolFarmRunning or not isActive() then
         return
     end
     toolFarmRunning = true
     safeSpawn(function()
-        while toolFarmRunning do
+        while toolFarmRunning and isActive() do
             pcall(function()
                 local player = Players.LocalPlayer
                 local char = player and player.Character
@@ -259,7 +283,7 @@ w:Button("Tool Farm", function()
                     tool:Activate()
                 end
             end)
-            safeWait()
+            safeWait(0.05)
         end
     end)
 end)
@@ -270,7 +294,9 @@ w:Section('Universal')
 w:Dropdown('Preset', {flag = "UniversalPreset", list = {"MaxFPS", "Balanced", "AFK"}}, function(preset)
     local api = getUniversal()
     if api then
-        api:SetPreset(preset)
+        safeSpawn(function()
+            api:SetPreset(preset)
+        end)
     end
 end)
 
@@ -291,14 +317,18 @@ end)
 w:Button('Rejoin Server', function()
     local api = getUniversal()
     if api then
-        api:Rejoin()
+        safeSpawn(function()
+            api:Rejoin()
+        end)
     end
 end)
 
 w:Button('Low-Player Server Hop', function()
     local api = getUniversal()
     if api then
-        api:ServerHop(true)
+        safeSpawn(function()
+            api:ServerHop(true)
+        end)
     end
 end)
 

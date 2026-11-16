@@ -335,8 +335,13 @@ local function isMenuOpen()
     return ok and open == true
 end
 
+local function isServerHopActive()
+    local hopUntil = tonumber(env.__UniversalLoaderHoppingUntil) or 0
+    return clockNow() < hopUntil
+end
+
 local function isExternalTeleportActive()
-    return clockNow() < state.externalTeleportUntil
+    return clockNow() < state.externalTeleportUntil or isServerHopActive()
 end
 
 local function isElementVisible(obj, stopAncestor)
@@ -567,6 +572,7 @@ local function performTeleport()
 
     local jobId = game and game.JobId
     local canTrySameServer = cfg.PreferSameServer
+        and not isServerHopActive()
         and not state.useFallbackPlace
         and type(jobId) == "string"
         and jobId ~= ""

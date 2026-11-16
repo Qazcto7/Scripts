@@ -113,6 +113,13 @@ local state = {
     panelGui = nil,
     panelVisible = false,
     panelRefreshFn = nil,
+    presetBtn = nil,
+    rejoinBtn = nil,
+    hopBtn = nil,
+    lowHopBtn = nil,
+    teleportBusy = false,
+    teleportBusyUntil = 0,
+    presetBusy = false,
     overlayThread = nil,
     stageThread = nil,
     savedMasterVolume = nil,
@@ -125,6 +132,16 @@ function state.cleanup()
     state.active = false
     state.panelVisible = false
     state.panelRefreshFn = nil
+    state.teleportBusy = false
+    state.teleportBusyUntil = 0
+    state.presetBusy = false
+    state.presetBtn = nil
+    state.rejoinBtn = nil
+    state.hopBtn = nil
+    state.lowHopBtn = nil
+    if env.__UniversalLoaderHoppingUntil ~= nil then
+        env.__UniversalLoaderHoppingUntil = nil
+    end
     if state.overlayThread then
         local ot = state.overlayThread
         state.overlayThread = nil
@@ -393,31 +410,72 @@ local function getQueueOnTeleportFn()
     )
 end
 
-local function fetchUrl(url)
-    for attempt = 1, cfg.RetryHttpAttempts do
-        if not isActive() then
-            return nil, "inactive"
-        end
+local function fetchUrl(url, preferRequestFirst)
+    local reqFn = getRequestFn()
+    local function tryHttpGet()
         if game and type(game.HttpGet) == "function" then
             local ok, body = pcall(function()
                 return game:HttpGet(url, true)
             end)
             if ok and type(body) == "string" and body ~= "" then
-                return body
+                return body, nil, 200
             end
         end
+        return nil, nil, nil
+    end
 
-        local reqFn = getRequestFn()
+    local function tryRequest()
         if reqFn then
             local ok, res = pcall(reqFn, {
                 Url = url,
                 Method = "GET",
+                Headers = preferRequestFirst and { Accept = "application/json" } or nil,
             })
-            if ok and type(res) == "table" and type(res.Body) == "string" and res.Body ~= "" then
+            if ok and type(res) == "table" then
                 local status = tonumber(res.StatusCode)
-                if not status or (status >= 200 and status < 300) then
-                    return res.Body
+                if status == 429 or status == 403 then
+                    return nil, "HTTP " .. tostring(status), status
                 end
+                if type(res.Body) == "string" and res.Body ~= "" then
+                    if not status or (status >= 200 and status < 300) then
+                        return res.Body, nil, status or 200
+                    end
+                    return nil, "HTTP " .. tostring(status), status
+                end
+            end
+        end
+        return nil, nil, nil
+    end
+
+    for attempt = 1, cfg.RetryHttpAttempts do
+        if not isActive() then
+            return nil, "inactive", nil
+        end
+
+        local body, reqErr, status
+        if preferRequestFirst and reqFn then
+            body, reqErr, status = tryRequest()
+            if body then
+                return body, nil, status
+            end
+            if status == 429 or status == 403 then
+                return nil, reqErr, status
+            end
+            body, reqErr, status = tryHttpGet()
+            if body then
+                return body, nil, status
+            end
+        else
+            body, reqErr, status = tryHttpGet()
+            if body then
+                return body, nil, status
+            end
+            body, reqErr, status = tryRequest()
+            if body then
+                return body, nil, status
+            end
+            if status == 429 or status == 403 then
+                return nil, reqErr, status
             end
         end
 
@@ -425,7 +483,7 @@ local function fetchUrl(url)
             waitTask(0.5)
         end
     end
-    return nil, "HTTP fetch failed"
+    return nil, "HTTP fetch failed", nil
 end
 
 local function executeSource(source, label)
@@ -929,7 +987,7 @@ local function createDarkOverlay()
         return nil, nil
     end
 
-    if not attachUniversalGui(gui, OVERLAY_NAME, -10, 2147483647) then
+    if not attachUniversalGui(gui, OVERLAY_NAME, -10, 2147483640) then
         pcall(function()
             gui:Destroy()
         end)
@@ -1050,6 +1108,9 @@ local function createControlPanel()
     local gui = nil
     local presetBtn = nil
     local afkBtn = nil
+    local rejoinBtn = nil
+    local hopBtn = nil
+    local lowHopBtn = nil
     local okCreate = pcall(function()
         gui = instLib.new("ScreenGui")
         gui.Name = PANEL_NAME
@@ -1229,7 +1290,7 @@ local function createControlPanel()
             end
         end
 
-        local function makePanelButton(btnName, initialText, yOffset, onClick)
+        local function makePanelButton(btnName, initialText, yOffset, onClick, isAsync)
             local btn = instLib.new("TextButton")
             btn.Name = btnName
             btn.BorderSizePixel = 0
@@ -1251,7 +1312,16 @@ local function createControlPanel()
             btn.Parent = mainFrame
             if btn.MouseButton1Click and type(onClick) == "function" then
                 trackConnection(btn.MouseButton1Click, function()
-                    if isActive() then
+                    if not isActive() then
+                        return
+                    end
+                    if isAsync and spawnTask then
+                        spawnTask(function()
+                            if isActive() then
+                                pcall(onClick)
+                            end
+                        end)
+                    else
                         pcall(onClick)
                     end
                 end)
@@ -1260,20 +1330,31 @@ local function createControlPanel()
         end
 
         presetBtn = makePanelButton("PresetBtn", "Preset: Balanced", 34, function()
-            api.CyclePreset()
-        end)
+            if state.presetBusy then
+                return
+            end
+            state.presetBusy = true
+            pcall(function()
+                presetBtn.Text = "Preset: Applying..."
+            end)
+            pcall(function()
+                api.CyclePreset()
+            end)
+            state.presetBusy = false
+            refreshControlPanel()
+        end, true)
         afkBtn = makePanelButton("AfkBtn", "AFK Mode: OFF", 62, function()
             api.ToggleAFK()
-        end)
-        makePanelButton("RejoinBtn", "Rejoin Server", 90, function()
+        end, false)
+        rejoinBtn = makePanelButton("RejoinBtn", "Rejoin Server", 90, function()
             api.Rejoin()
-        end)
-        makePanelButton("HopBtn", "Server Hop", 118, function()
+        end, true)
+        hopBtn = makePanelButton("HopBtn", "Server Hop", 118, function()
             api.ServerHop(false)
-        end)
-        makePanelButton("LowHopBtn", "Low-Player Hop", 146, function()
+        end, true)
+        lowHopBtn = makePanelButton("LowHopBtn", "Low-Player Hop", 146, function()
             api.ServerHop(true)
-        end)
+        end, true)
     end)
 
     if not okCreate or not gui then
@@ -1287,8 +1368,13 @@ local function createControlPanel()
         return nil
     end
 
+    state.presetBtn = presetBtn
+    state.rejoinBtn = rejoinBtn
+    state.hopBtn = hopBtn
+    state.lowHopBtn = lowHopBtn
+
     state.panelRefreshFn = function()
-        if presetBtn then
+        if presetBtn and not state.presetBusy then
             pcall(function()
                 presetBtn.Text = "Preset: " .. api.GetPreset()
             end)
@@ -1302,6 +1388,17 @@ local function createControlPanel()
                         or Color3.fromRGB(42, 44, 56)
                 end
             end)
+        end
+        if not state.teleportBusy then
+            if rejoinBtn then
+                pcall(function() rejoinBtn.Text = "Rejoin Server" end)
+            end
+            if hopBtn then
+                pcall(function() hopBtn.Text = "Server Hop" end)
+            end
+            if lowHopBtn then
+                pcall(function() lowHopBtn.Text = "Low-Player Hop" end)
+            end
         end
     end
     state.panelRefreshFn()
@@ -1390,9 +1487,40 @@ function api.CyclePreset()
     return api.SetPreset(nextPreset)
 end
 
+local function setBtnLabel(btn, text)
+    if btn then
+        pcall(function()
+            btn.Text = text
+        end)
+    end
+end
+
+local function scheduleTeleportUnlock(delaySec, btn, failText)
+    state.teleportBusy = false
+    if env.__UniversalLoaderHoppingUntil and clockNow() >= (tonumber(env.__UniversalLoaderHoppingUntil) or 0) then
+        env.__UniversalLoaderHoppingUntil = nil
+    end
+    if failText and btn then
+        setBtnLabel(btn, failText)
+        if hasRealSpawn and spawnTask then
+            spawnTask(function()
+                waitTask(delaySec or 2)
+                if isActive() then
+                    refreshControlPanel()
+                end
+            end)
+            return
+        end
+    end
+    refreshControlPanel()
+end
+
 function api.Rejoin(first, second)
     if not isActive() then
         return false, "inactive"
+    end
+    if state.teleportBusy and clockNow() < state.teleportBusyUntil then
+        return false, "Teleport already in progress"
     end
     local preferSame = unwrapApiArg(first, second) == true
     local TeleportService = safeGetService("TeleportService")
@@ -1404,31 +1532,49 @@ function api.Rejoin(first, second)
         return false, "Invalid PlaceId"
     end
 
+    state.teleportBusy = true
+    state.teleportBusyUntil = clockNow() + 12
+    setBtnLabel(state.rejoinBtn, "Rejoining...")
+
     armTeleportQueueOnce()
 
     local jobId = game and game.JobId
+    local okTp, errTp
     if preferSame and type(jobId) == "string" and jobId ~= "" then
-        local okSame, errSame = pcall(function()
+        okTp, errTp = pcall(function()
             TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
         end)
-        if okSame then
-            return true
-        end
-        return false, tostring(errSame)
+    else
+        okTp, errTp = pcall(function()
+            TeleportService:Teleport(placeId, LocalPlayer)
+        end)
     end
 
-    local okTp, errTp = pcall(function()
-        TeleportService:Teleport(placeId, LocalPlayer)
-    end)
     if okTp then
+        if hasRealSpawn and spawnTask then
+            spawnTask(function()
+                waitTask(8)
+                if isActive() and state.teleportBusy then
+                    state.teleportBusy = false
+                    refreshControlPanel()
+                end
+            end)
+        else
+            state.teleportBusy = false
+        end
         return true
     end
+
+    scheduleTeleportUnlock(2, state.rejoinBtn, "Rejoin Failed")
     return false, tostring(errTp)
 end
 
 function api.ServerHop(first, second)
     if not isActive() then
         return false, "inactive"
+    end
+    if state.teleportBusy and clockNow() < state.teleportBusyUntil then
+        return false, "Teleport already in progress"
     end
     local preferLowPlayer = unwrapApiArg(first, second) == true
     local HttpService = safeGetService("HttpService")
@@ -1442,15 +1588,26 @@ function api.ServerHop(first, second)
         return false, "Invalid PlaceId"
     end
 
+    local activeBtn = preferLowPlayer and state.lowHopBtn or state.hopBtn
+    state.teleportBusy = true
+    state.teleportBusyUntil = clockNow() + 20
+    env.__UniversalLoaderHoppingUntil = clockNow() + 25
+    setBtnLabel(activeBtn, "Searching...")
+
     local sortOrder = preferLowPlayer and "Asc" or "Desc"
-    local url = string.format(
+    local baseApiUrl = string.format(
         "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100",
         math.floor(placeId),
         sortOrder
     )
 
-    local body, fetchErr = fetchUrl(url)
+    local body, fetchErr, httpStatus = fetchUrl(baseApiUrl .. "&excludeFullGames=true", true)
+    if not body and httpStatus ~= 429 and httpStatus ~= 403 then
+        body, fetchErr, httpStatus = fetchUrl(baseApiUrl, true)
+    end
     if not body then
+        local failLabel = (httpStatus == 429) and "Rate Limited" or "Fetch Failed"
+        scheduleTeleportUnlock(2, activeBtn, failLabel)
         return false, fetchErr or "Failed to fetch servers"
     end
 
@@ -1458,6 +1615,7 @@ function api.ServerHop(first, second)
         return HttpService:JSONDecode(body)
     end)
     if not okDecode or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+        scheduleTeleportUnlock(2, activeBtn, "Bad Response")
         return false, "Invalid server list JSON"
     end
 
@@ -1474,32 +1632,104 @@ function api.ServerHop(first, second)
     end
 
     if #candidates == 0 then
+        scheduleTeleportUnlock(2, activeBtn, "No Open Servers")
         return false, "No open servers found"
     end
 
-    local chosen = candidates[1]
     if preferLowPlayer then
-        local lowestCount = tonumber(chosen.playing) or math.huge
-        for i = 2, #candidates do
-            local p = tonumber(candidates[i].playing) or math.huge
-            if p < lowestCount then
-                lowestCount = p
-                chosen = candidates[i]
-            end
-        end
+        table.sort(candidates, function(a, b)
+            return (tonumber(a.playing) or math.huge) < (tonumber(b.playing) or math.huge)
+        end)
     else
-        chosen = candidates[math.random(1, #candidates)]
+        for i = #candidates, 2, -1 do
+            local j = math.random(1, i)
+            candidates[i], candidates[j] = candidates[j], candidates[i]
+        end
     end
 
     armTeleportQueueOnce()
 
-    local okHop, errHop = pcall(function()
-        TeleportService:TeleportToPlaceInstance(placeId, chosen.id, LocalPlayer)
-    end)
-    if okHop then
-        return true, chosen.id
+    local initFailed = false
+    local initFailedNonRetry = false
+    local failConn = nil
+    if hasRealSpawn and TeleportService.TeleportInitFailed then
+        local okSig, conn = pcall(function()
+            return TeleportService.TeleportInitFailed:Connect(function(plr, tpResult)
+                if plr ~= LocalPlayer then
+                    return
+                end
+                if Enum and Enum.TeleportResult and tpResult == Enum.TeleportResult.IsTeleporting then
+                    initFailedNonRetry = true
+                else
+                    initFailed = true
+                end
+            end)
+        end)
+        if okSig and conn then
+            failConn = conn
+        end
     end
-    return false, tostring(errHop)
+
+    local maxTries = math.min(#candidates, 3)
+    local lastErr = "Teleport failed"
+    for idx = 1, maxTries do
+        if not isActive() then
+            break
+        end
+        local chosen = candidates[idx]
+        initFailed = false
+        initFailedNonRetry = false
+        setBtnLabel(activeBtn, string.format("Joining (%dp)...", tonumber(chosen.playing) or 0))
+
+        local okHop, errHop = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, chosen.id, LocalPlayer)
+        end)
+
+        if okHop then
+            if hasRealSpawn then
+                local waited = 0
+                while isActive() and waited < 2.0 and not initFailed and not initFailedNonRetry do
+                    waitTask(0.25)
+                    waited = waited + 0.25
+                end
+                if not initFailed then
+                    if failConn then
+                        pcall(function() failConn:Disconnect() end)
+                        failConn = nil
+                    end
+                    if spawnTask then
+                        spawnTask(function()
+                            waitTask(6)
+                            if isActive() and state.teleportBusy then
+                                state.teleportBusy = false
+                                env.__UniversalLoaderHoppingUntil = nil
+                                refreshControlPanel()
+                            end
+                        end)
+                    else
+                        state.teleportBusy = false
+                    end
+                    return true, chosen.id
+                end
+                lastErr = "Server rejected teleport"
+            else
+                if failConn then
+                    pcall(function() failConn:Disconnect() end)
+                end
+                state.teleportBusy = false
+                env.__UniversalLoaderHoppingUntil = nil
+                return true, chosen.id
+            end
+        else
+            lastErr = tostring(errHop)
+        end
+    end
+
+    if failConn then
+        pcall(function() failConn:Disconnect() end)
+    end
+    scheduleTeleportUnlock(2, activeBtn, "Hop Failed")
+    return false, lastErr
 end
 
 function api.IsPanelVisible()
@@ -1574,7 +1804,7 @@ if UserInputService then
     if cfg.AutoAFKOnUnfocus then
         if UserInputService.WindowFocusReleased then
             trackConnection(UserInputService.WindowFocusReleased, function()
-                if not isActive() or state.focusAfk then
+                if not isActive() or state.focusAfk or state.teleportBusy then
                     return
                 end
                 state.focusAfk = true
