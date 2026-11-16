@@ -114,10 +114,11 @@ do
         if not parent then
             return false
         end
-        local ok = pcall(function()
+        local ok, attached = pcall(function()
             gui.Parent = parent
+            return gui.Parent == parent
         end)
-        return ok and gui.Parent == parent
+        return ok and attached == true
     end
 
     local function attachRootGui(gui)
@@ -128,8 +129,8 @@ do
         local localPlayer = Players and Players.LocalPlayer
         if localPlayer then
             if type(localPlayer.FindFirstChildOfClass) == "function" then
-                local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
-                if tryParentGui(gui, pg) then
+                local okPg, pg = pcall(localPlayer.FindFirstChildOfClass, localPlayer, "PlayerGui")
+                if okPg and tryParentGui(gui, pg) then
                     return true
                 end
             end
@@ -221,7 +222,10 @@ do
             return false
         end
         if valueType(obj) == "Instance" then
-            return obj.Parent ~= nil
+            local ok, hasParent = pcall(function()
+                return obj.Parent ~= nil
+            end)
+            return ok and hasParent
         end
         return true
     end

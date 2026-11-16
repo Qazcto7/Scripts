@@ -800,7 +800,10 @@ if cfg.ReconnectOnErrorPrompt and CoreGui then
             if not child then
                 return false
             end
-            if child.Name == "ErrorPrompt" then
+            local okName, childName = pcall(function()
+                return child.Name
+            end)
+            if okName and childName == "ErrorPrompt" then
                 return true
             end
             local ok, buttonArea = pcall(function()
@@ -817,7 +820,10 @@ if cfg.ReconnectOnErrorPrompt and CoreGui then
                 if cfg.PromptDelay > 0 then
                     waitTask(cfg.PromptDelay)
                 end
-                if isActive() and child.Parent == overlay then
+                local okParent, sameParent = pcall(function()
+                    return child.Parent == overlay
+                end)
+                if isActive() and okParent and sameParent then
                     attemptRejoin("ErrorPrompt opened")
                 end
             end
@@ -835,7 +841,13 @@ if cfg.ReconnectOnErrorPrompt and CoreGui then
 
     pcall(function()
         trackConnection(CoreGui.ChildAdded, function(child)
-            if isActive() and child and child.Name == "RobloxPromptGui" then
+            if not isActive() or not child then
+                return
+            end
+            local okName, childName = pcall(function()
+                return child.Name
+            end)
+            if okName and childName == "RobloxPromptGui" then
                 waitTask(0.1)
                 if isActive() then
                     tryBindPromptGui()

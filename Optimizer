@@ -887,7 +887,10 @@ local function resolveHandler(inst, className)
     return nil
 end
 
-local function optimizeInstance(inst)
+local function optimizeInstanceUnsafe(inst)
+    if not inst or not inst.Parent then
+        return false
+    end
     local className = inst.ClassName
     if SKIP_CLASSES[className] then
         return false
@@ -905,8 +908,16 @@ local function optimizeInstance(inst)
         return false
     end
 
-    local ok = pcall(handler, inst)
-    return ok
+    handler(inst)
+    return true
+end
+
+local function optimizeInstance(inst)
+    if not inst then
+        return false
+    end
+    local ok, res = pcall(optimizeInstanceUnsafe, inst)
+    return ok and res == true
 end
 
 local function applyTerrainSettings(terrain)
@@ -1034,7 +1045,21 @@ local function applyGlobalSettings()
         end
     end
 
-    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    local function getTerrainSafe()
+        local okProp, propVal = pcall(function()
+            return Workspace.Terrain
+        end)
+        if okProp and propVal then
+            return propVal
+        end
+        local okFind, found = pcall(Workspace.FindFirstChildOfClass, Workspace, "Terrain")
+        if okFind then
+            return found
+        end
+        return nil
+    end
+
+    local terrain = getTerrainSafe()
     if terrain then
         applyTerrainSettings(terrain)
     elseif type(Workspace.GetPropertyChangedSignal) == "function" then
@@ -1042,7 +1067,7 @@ local function applyGlobalSettings()
         if ok and sig then
             local terrainConn
             terrainConn = trackConnection(sig:Connect(function()
-                local t = Workspace:FindFirstChildOfClass("Terrain")
+                local t = getTerrainSafe()
                 if t then
                     applyTerrainSettings(t)
                     disconnectConn(terrainConn)
@@ -1056,8 +1081,16 @@ end
 local INITIAL_FRAME_BUDGET = 0.004 -- 4ms per frame during initial pass
 local DYNAMIC_FRAME_BUDGET = 0.002 -- 2ms per frame during gameplay
 
+local function isSkippableQuick(inst)
+    return not inst or SKIP_CLASSES[inst.ClassName]
+end
+
 local function enqueueInstance(inst)
-    if not isActive() or not inst or SKIP_CLASSES[inst.ClassName] then
+    if not isActive() or not inst then
+        return
+    end
+    local ok, skip = pcall(isSkippableQuick, inst)
+    if not ok or skip then
         return
     end
     if not pendingSet[inst] then
@@ -1077,9 +1110,11 @@ if dynamicOptimize then
             trackConnection(sig:Connect(function()
                 local cam = Workspace.CurrentCamera
                 if cam then
-                    local camDescendants = cam:GetDescendants()
-                    for i = 1, #camDescendants do
-                        enqueueInstance(camDescendants[i])
+                    local okDesc, camDescendants = pcall(cam.GetDescendants, cam)
+                    if okDesc and type(camDescendants) == "table" then
+                        for i = 1, #camDescendants do
+                            enqueueInstance(camDescendants[i])
+                        end
                     end
                 end
             end))
@@ -1098,9 +1133,7 @@ if dynamicOptimize then
             queueHead = queueHead + 1
             if inst then
                 pendingSet[inst] = nil
-                if inst.Parent then
-                    optimizeInstance(inst)
-                end
+                optimizeInstance(inst)
             end
             processed = processed + 1
             if processed % 64 == 0 and (os.clock() - sliceStart) >= DYNAMIC_FRAME_BUDGET then
@@ -1131,10 +1164,8 @@ local function scanContainer(container, budget)
             return total, optimized, workTime
         end
         local inst = descendants[i]
-        if inst and inst.Parent then
-            if optimizeInstance(inst) then
-                optimized = optimized + 1
-            end
+        if inst and optimizeInstance(inst) then
+            optimized = optimized + 1
         end
         if i % 256 == 0 then
             local now = os.clock()
@@ -1155,19 +1186,17 @@ local function scanContainer(container, budget)
 end
 
 -- Apply top-level Lighting & CurrentCamera immediately so visual effects disappear on frame 1
-local lightingChildren = Lighting:GetChildren()
-for i = 1, #lightingChildren do
-    local inst = lightingChildren[i]
-    if inst and inst.Parent then
-        optimizeInstance(inst)
+local okLightChildren, lightingChildren = pcall(Lighting.GetChildren, Lighting)
+if okLightChildren and type(lightingChildren) == "table" then
+    for i = 1, #lightingChildren do
+        optimizeInstance(lightingChildren[i])
     end
 end
 if Workspace.CurrentCamera then
-    local camDescendants = Workspace.CurrentCamera:GetDescendants()
-    for i = 1, #camDescendants do
-        local inst = camDescendants[i]
-        if inst and inst.Parent then
-            optimizeInstance(inst)
+    local okCamDesc, camDescendants = pcall(Workspace.CurrentCamera.GetDescendants, Workspace.CurrentCamera)
+    if okCamDesc and type(camDescendants) == "table" then
+        for i = 1, #camDescendants do
+            optimizeInstance(camDescendants[i])
         end
     end
 end

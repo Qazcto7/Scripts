@@ -118,8 +118,14 @@ w:Section('Auto Farm')
 
 local remoteEvent = nil
 local function getRemoteEvent()
-    if remoteEvent and remoteEvent.Parent then
-        return remoteEvent
+    if remoteEvent then
+        local okParent, hasParent = pcall(function()
+            return remoteEvent.Parent ~= nil
+        end)
+        if okParent and hasParent then
+            return remoteEvent
+        end
+        remoteEvent = nil
     end
     local okFind, found = pcall(function()
         return ReplicatedStorage:FindFirstChild("RemoteEvent") or ReplicatedStorage:WaitForChild("RemoteEvent", 2)
