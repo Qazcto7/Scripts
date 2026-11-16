@@ -17,6 +17,8 @@ local DEFAULT_SETTINGS = {
     AutoAFKOnUnfocus = true, -- pause 3D rendering & cap FPS on Alt-Tab / window unfocus, restore on return
     MuteSoundsOnAFK = true, -- mute MasterVolume while AFK mode is active and restore on exit
     MuteAllSounds = false, -- permanently silence game sounds via Optimizer ("Mute Sounds")
+    ShowPanel = false, -- show compact draggable Universal Controls window on screen
+    PanelToggleKey = nil, -- optional hotkey (e.g. "F7" or Enum.KeyCode.F7) to toggle the panel
     StagedExecution = true, -- stagger module loads instead of slamming frame 0
     AntiAFKDelay = 2, -- seconds after execute before Anti-AFK loads
     OptimizerDelay = 3, -- seconds after Anti-AFK before Optimizer loads
@@ -108,14 +110,21 @@ local state = {
     afkKeyLabel = nil,
     afkStatusLabel = nil,
     afkOverlay = nil,
+    panelGui = nil,
+    panelVisible = false,
+    panelRefreshFn = nil,
     overlayThread = nil,
     stageThread = nil,
     savedMasterVolume = nil,
+    sourceCache = {},
+    api = nil,
     connections = {},
 }
 
 function state.cleanup()
     state.active = false
+    state.panelVisible = false
+    state.panelRefreshFn = nil
     if state.overlayThread then
         local ot = state.overlayThread
         state.overlayThread = nil
@@ -149,6 +158,22 @@ function state.cleanup()
             overlay.Enabled = false
             overlay:Destroy()
         end)
+    end
+    if state.panelGui then
+        local panel = state.panelGui
+        state.panelGui = nil
+        pcall(function()
+            panel.Enabled = false
+            panel:Destroy()
+        end)
+    end
+    if state.api then
+        if env.UniversalLoader == state.api then
+            env.UniversalLoader = nil
+        end
+        if _G and _G.UniversalLoader == state.api then
+            _G.UniversalLoader = nil
+        end
     end
     for i = #state.connections, 1, -1 do
         local conn = state.connections[i]
@@ -264,6 +289,7 @@ cfg.AFKFPSCap = math.max(1, math.floor(tonumber(cfg.AFKFPSCap) or DEFAULT_SETTIN
 cfg.AutoAFKOnUnfocus = cfg.AutoAFKOnUnfocus ~= false
 cfg.MuteSoundsOnAFK = cfg.MuteSoundsOnAFK ~= false
 cfg.MuteAllSounds = cfg.MuteAllSounds == true
+cfg.ShowPanel = cfg.ShowPanel == true
 cfg.StagedExecution = cfg.StagedExecution ~= false
 cfg.AntiAFKDelay = math.max(0, tonumber(cfg.AntiAFKDelay) or DEFAULT_SETTINGS.AntiAFKDelay)
 cfg.OptimizerDelay = math.max(0, tonumber(cfg.OptimizerDelay) or DEFAULT_SETTINGS.OptimizerDelay)
@@ -426,12 +452,16 @@ local function executeSource(source, label)
     return true
 end
 
-local function runUrlOrCode(entry, label)
+local function runUrlOrCode(entry, label, useCache)
     if type(entry) ~= "string" or entry == "" then
         return false
     end
     local trimmed = entry:match("^%s*(.-)%s*$") or ""
     if trimmed:match("^https?://") then
+        local cached = useCache and state.sourceCache[trimmed] or nil
+        if type(cached) == "string" and cached ~= "" then
+            return executeSource(cached, label)
+        end
         local src, fetchErr = fetchUrl(trimmed)
         if not src then
             if warn then
@@ -439,6 +469,7 @@ local function runUrlOrCode(entry, label)
             end
             return false
         end
+        state.sourceCache[trimmed] = src
         return executeSource(src, label)
     end
     return executeSource(entry, label)
@@ -747,12 +778,12 @@ local function startOverlayTimer()
     end)
 end
 
-local function destroyExistingOverlay(parent)
+local function destroyNamedGui(parent, guiName)
     if not parent or type(parent.FindFirstChild) ~= "function" then
         return
     end
     pcall(function()
-        local old = parent:FindFirstChild(OVERLAY_NAME)
+        local old = parent:FindFirstChild(guiName)
         if old then
             old:Destroy()
         end
@@ -786,10 +817,11 @@ local function getOverlayContainers(allowHui)
     return coreGui, hiddenUi, playerGui
 end
 
-local function clearAllOverlays(coreGui, hiddenUi, playerGui)
-    destroyExistingOverlay(coreGui)
-    destroyExistingOverlay(hiddenUi)
-    destroyExistingOverlay(playerGui)
+local function clearAllOverlays(coreGui, hiddenUi, playerGui, guiName)
+    local targetName = guiName or OVERLAY_NAME
+    destroyNamedGui(coreGui, targetName)
+    destroyNamedGui(hiddenUi, targetName)
+    destroyNamedGui(playerGui, targetName)
 end
 
 local function attachOverlayParent(gui, candidate, displayOrder)
@@ -803,6 +835,29 @@ local function attachOverlayParent(gui, candidate, displayOrder)
     return ok and gui.Parent == candidate
 end
 
+local function attachUniversalGui(gui, guiName, primaryOrder, playerGuiOrder)
+    local allowHui = (env.__UniversalLoaderUsedHui == true)
+    local coreGui, hiddenUi, playerGui = getOverlayContainers(allowHui)
+    clearAllOverlays(coreGui, hiddenUi, playerGui, guiName)
+
+    local attached = attachOverlayParent(gui, coreGui, primaryOrder)
+        or attachOverlayParent(gui, playerGui, playerGuiOrder or 2147483647)
+
+    if not attached then
+        hiddenUi = hiddenUi or getHiddenUiContainer()
+        if hiddenUi then
+            destroyNamedGui(hiddenUi, guiName)
+            attached = attachOverlayParent(gui, hiddenUi, primaryOrder)
+            if attached then
+                pcall(function()
+                    env.__UniversalLoaderUsedHui = true
+                end)
+            end
+        end
+    end
+    return attached
+end
+
 local function createDarkOverlay()
     local okInst, instLib = pcall(function()
         return Instance
@@ -810,10 +865,6 @@ local function createDarkOverlay()
     if not okInst or not instLib or type(instLib.new) ~= "function" then
         return nil, nil
     end
-
-    local allowHui = (env.__UniversalLoaderUsedHui == true)
-    local coreGui, hiddenUi, playerGui = getOverlayContainers(allowHui)
-    clearAllOverlays(coreGui, hiddenUi, playerGui)
 
     local gui = nil
     local statusLabel = nil
@@ -867,23 +918,7 @@ local function createDarkOverlay()
         return nil, nil
     end
 
-    local attached = attachOverlayParent(gui, coreGui, -10)
-        or attachOverlayParent(gui, playerGui, 2147483647)
-
-    if not attached then
-        hiddenUi = hiddenUi or getHiddenUiContainer()
-        if hiddenUi then
-            destroyExistingOverlay(hiddenUi)
-            attached = attachOverlayParent(gui, hiddenUi, -10)
-            if attached then
-                pcall(function()
-                    env.__UniversalLoaderUsedHui = true
-                end)
-            end
-        end
-    end
-
-    if not attached then
+    if not attachUniversalGui(gui, OVERLAY_NAME, -10, 2147483647) then
         pcall(function()
             gui:Destroy()
         end)
@@ -902,7 +937,7 @@ local function syncAfkDarkOverlay(enabled)
         elseif cfg.AFKDarkScreen then
             local allowHui = (env.__UniversalLoaderUsedHui == true)
             local coreGui, hiddenUi, playerGui = getOverlayContainers(allowHui)
-            clearAllOverlays(coreGui, hiddenUi, playerGui)
+            clearAllOverlays(coreGui, hiddenUi, playerGui, OVERLAY_NAME)
         end
         return
     end
@@ -915,6 +950,12 @@ local function syncAfkDarkOverlay(enabled)
             state.afkOverlay.Enabled = true
         end)
         startOverlayTimer()
+    end
+end
+
+local function refreshControlPanel()
+    if type(state.panelRefreshFn) == "function" then
+        pcall(state.panelRefreshFn)
     end
 end
 
@@ -931,32 +972,590 @@ local function applyAfkMode(reasonText)
     end
     syncAfkAudio(shouldAfk)
     syncAfkDarkOverlay(shouldAfk)
+    refreshControlPanel()
     if reasonText then
         notify("Universal Loader", reasonText)
     end
 end
 
--- Arm teleport replay, initial AFK overlay/audio, F8 hotkey & Alt-Tab focus listener immediately
+local PANEL_NAME = "__UniversalLoaderPanel"
+local PRESET_CYCLE = { "Balanced", "MaxFPS", "AFK" }
+local CANONICAL_PRESETS = {
+    balanced = "Balanced",
+    maxfps = "MaxFPS",
+    afk = "AFK",
+}
+
+local function buildOptimizerSettings(preserveManualToggle)
+    local userOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
+    local finalOpt = mergeTables(presetBase, cfg.OptimizerSettings)
+    if userOpt then
+        finalOpt = mergeTables(finalOpt, userOpt)
+    end
+    finalOpt.Other = finalOpt.Other or {}
+
+    if cfg.MuteAllSounds then
+        finalOpt.Other["Mute Sounds"] = true
+    end
+
+    local isAfkTarget = (presetKey == "afk") or state.afkRenderDisabled or state.manualAfk
+    local explicitCap = tonumber(finalOpt.Other["FPS Cap"])
+    if explicitCap and explicitCap > 0 and not (isAfkTarget and (explicitCap == cfg.AFKFPSCap or explicitCap == 15)) then
+        restoredCap = explicitCap
+    end
+
+    if preserveManualToggle and (state.afkToggledManually or state.focusAfk) then
+        finalOpt.Other["Disable 3D Rendering"] = state.afkRenderDisabled
+        if state.afkRenderDisabled then
+            finalOpt.Other["FPS Cap"] = cfg.AFKFPSCap
+        else
+            finalOpt.Other["FPS Cap"] = (restoredCap ~= 999) and restoredCap or false
+        end
+    elseif finalOpt.Other["Disable 3D Rendering"] ~= nil then
+        state.manualAfk = finalOpt.Other["Disable 3D Rendering"] == true
+        state.afkRenderDisabled = state.manualAfk or state.focusAfk
+    end
+
+    return finalOpt
+end
+
+local api = {}
+
+local function unwrapApiArg(first, second)
+    if first == api then
+        return second
+    end
+    return first
+end
+
+local function createControlPanel()
+    local okInst, instLib = pcall(function()
+        return Instance
+    end)
+    if not okInst or not instLib or type(instLib.new) ~= "function" then
+        return nil
+    end
+
+    local gui = nil
+    local presetBtn = nil
+    local afkBtn = nil
+    local okCreate = pcall(function()
+        gui = instLib.new("ScreenGui")
+        gui.Name = PANEL_NAME
+        gui.IgnoreGuiInset = false
+        gui.ResetOnSpawn = false
+        gui.Enabled = false
+
+        local panelWidth = 196
+        local expandedHeight = 174
+        local collapsedHeight = 28
+
+        local mainFrame = instLib.new("Frame")
+        mainFrame.Name = "Main"
+        mainFrame.BorderSizePixel = 0
+        mainFrame.ClipsDescendants = true
+        mainFrame.Active = true
+        if UDim2 and type(UDim2.new) == "function" then
+            mainFrame.Size = UDim2.new(0, panelWidth, 0, expandedHeight)
+            mainFrame.Position = UDim2.new(0, 20, 0, 220)
+        end
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                mainFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+            end
+        end)
+        mainFrame.Parent = gui
+
+        local header = instLib.new("Frame")
+        header.Name = "Header"
+        header.BorderSizePixel = 0
+        header.Active = true
+        if UDim2 and type(UDim2.new) == "function" then
+            header.Size = UDim2.new(1, 0, 0, collapsedHeight)
+            header.Position = UDim2.new(0, 0, 0, 0)
+        end
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                header.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+            end
+        end)
+        header.Parent = mainFrame
+
+        local titleLbl = instLib.new("TextLabel")
+        titleLbl.Name = "Title"
+        titleLbl.BackgroundTransparency = 1
+        titleLbl.Text = "Universal Controls"
+        titleLbl.TextSize = 14
+        if UDim2 and type(UDim2.new) == "function" then
+            titleLbl.Size = UDim2.new(1, -54, 1, 0)
+            titleLbl.Position = UDim2.new(0, 8, 0, 0)
+        end
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                titleLbl.TextColor3 = Color3.fromRGB(235, 238, 245)
+            end
+            if Enum and Enum.TextXAlignment and Enum.TextXAlignment.Left then
+                titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+            end
+            if Enum and Enum.Font and Enum.Font.SourceSans then
+                titleLbl.Font = Enum.Font.SourceSans
+            end
+        end)
+        titleLbl.Parent = header
+
+        local isMinimized = false
+        local minBtn = instLib.new("TextButton")
+        minBtn.Name = "Minimize"
+        minBtn.BorderSizePixel = 0
+        minBtn.Text = "-"
+        minBtn.TextSize = 16
+        if UDim2 and type(UDim2.new) == "function" then
+            minBtn.Size = UDim2.new(0, 22, 0, 22)
+            minBtn.Position = UDim2.new(1, -48, 0, 3)
+        end
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                minBtn.BackgroundColor3 = Color3.fromRGB(40, 42, 54)
+                minBtn.TextColor3 = Color3.fromRGB(220, 224, 235)
+            end
+            if Enum and Enum.Font and Enum.Font.SourceSans then
+                minBtn.Font = Enum.Font.SourceSans
+            end
+        end)
+        minBtn.Parent = header
+        if minBtn.MouseButton1Click then
+            trackConnection(minBtn.MouseButton1Click, function()
+                if not isActive() then
+                    return
+                end
+                isMinimized = not isMinimized
+                minBtn.Text = isMinimized and "+" or "-"
+                if UDim2 and type(UDim2.new) == "function" then
+                    mainFrame.Size = UDim2.new(0, panelWidth, 0, isMinimized and collapsedHeight or expandedHeight)
+                end
+            end)
+        end
+
+        local closeBtn = instLib.new("TextButton")
+        closeBtn.Name = "Close"
+        closeBtn.BorderSizePixel = 0
+        closeBtn.Text = "x"
+        closeBtn.TextSize = 14
+        if UDim2 and type(UDim2.new) == "function" then
+            closeBtn.Size = UDim2.new(0, 22, 0, 22)
+            closeBtn.Position = UDim2.new(1, -24, 0, 3)
+        end
+        pcall(function()
+            if Color3 and type(Color3.fromRGB) == "function" then
+                closeBtn.BackgroundColor3 = Color3.fromRGB(40, 42, 54)
+                closeBtn.TextColor3 = Color3.fromRGB(220, 224, 235)
+            end
+            if Enum and Enum.Font and Enum.Font.SourceSans then
+                closeBtn.Font = Enum.Font.SourceSans
+            end
+        end)
+        closeBtn.Parent = header
+        if closeBtn.MouseButton1Click then
+            trackConnection(closeBtn.MouseButton1Click, function()
+                if isActive() then
+                    api.SetPanelVisible(false)
+                end
+            end)
+        end
+
+        if header.InputBegan and UserInputService then
+            local dragging = false
+            local dragInputType = nil
+            local dragStart = nil
+            local startPos = nil
+
+            trackConnection(header.InputBegan, function(input)
+                if not isActive() or not input then
+                    return
+                end
+                local uType = input.UserInputType
+                if Enum and Enum.UserInputType then
+                    if uType ~= Enum.UserInputType.MouseButton1 and uType ~= Enum.UserInputType.Touch then
+                        return
+                    end
+                end
+                dragging = true
+                dragInputType = uType
+                dragStart = input.Position
+                startPos = mainFrame.Position
+            end)
+
+            if UserInputService.InputChanged then
+                trackConnection(UserInputService.InputChanged, function(input)
+                    if not dragging or not isActive() or not input or not dragStart or not startPos then
+                        return
+                    end
+                    local uType = input.UserInputType
+                    if Enum and Enum.UserInputType then
+                        if uType ~= Enum.UserInputType.MouseMovement and uType ~= Enum.UserInputType.Touch then
+                            return
+                        end
+                    end
+                    if input.Position and UDim2 and type(UDim2.new) == "function" then
+                        local delta = input.Position - dragStart
+                        mainFrame.Position = UDim2.new(
+                            startPos.X.Scale,
+                            startPos.X.Offset + delta.X,
+                            startPos.Y.Scale,
+                            startPos.Y.Offset + delta.Y
+                        )
+                    end
+                end)
+            end
+
+            if UserInputService.InputEnded then
+                trackConnection(UserInputService.InputEnded, function(input)
+                    if dragging and input and (input.UserInputType == dragInputType or (Enum and Enum.UserInputType and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+                        dragging = false
+                        dragInputType = nil
+                    end
+                end)
+            end
+        end
+
+        local function makePanelButton(btnName, initialText, yOffset, onClick)
+            local btn = instLib.new("TextButton")
+            btn.Name = btnName
+            btn.BorderSizePixel = 0
+            btn.Text = initialText
+            btn.TextSize = 14
+            if UDim2 and type(UDim2.new) == "function" then
+                btn.Size = UDim2.new(1, -16, 0, 24)
+                btn.Position = UDim2.new(0, 8, 0, yOffset)
+            end
+            pcall(function()
+                if Color3 and type(Color3.fromRGB) == "function" then
+                    btn.BackgroundColor3 = Color3.fromRGB(42, 44, 56)
+                    btn.TextColor3 = Color3.fromRGB(235, 238, 245)
+                end
+                if Enum and Enum.Font and Enum.Font.SourceSans then
+                    btn.Font = Enum.Font.SourceSans
+                end
+            end)
+            btn.Parent = mainFrame
+            if btn.MouseButton1Click and type(onClick) == "function" then
+                trackConnection(btn.MouseButton1Click, function()
+                    if isActive() then
+                        pcall(onClick)
+                    end
+                end)
+            end
+            return btn
+        end
+
+        presetBtn = makePanelButton("PresetBtn", "Preset: Balanced", 34, function()
+            api.CyclePreset()
+        end)
+        afkBtn = makePanelButton("AfkBtn", "AFK Mode: OFF", 62, function()
+            api.ToggleAFK()
+        end)
+        makePanelButton("RejoinBtn", "Rejoin Server", 90, function()
+            api.Rejoin()
+        end)
+        makePanelButton("HopBtn", "Server Hop", 118, function()
+            api.ServerHop(false)
+        end)
+        makePanelButton("LowHopBtn", "Low-Player Hop", 146, function()
+            api.ServerHop(true)
+        end)
+    end)
+
+    if not okCreate or not gui then
+        return nil
+    end
+
+    if not attachUniversalGui(gui, PANEL_NAME, 5, 2147483646) then
+        pcall(function()
+            gui:Destroy()
+        end)
+        return nil
+    end
+
+    state.panelRefreshFn = function()
+        if presetBtn then
+            pcall(function()
+                presetBtn.Text = "Preset: " .. api.GetPreset()
+            end)
+        end
+        if afkBtn then
+            pcall(function()
+                afkBtn.Text = "AFK Mode: " .. (state.afkRenderDisabled and "ON" or "OFF")
+                if Color3 and type(Color3.fromRGB) == "function" then
+                    afkBtn.BackgroundColor3 = state.afkRenderDisabled
+                        and Color3.fromRGB(36, 92, 62)
+                        or Color3.fromRGB(42, 44, 56)
+                end
+            end)
+        end
+    end
+    state.panelRefreshFn()
+
+    return gui
+end
+
+function api.IsAFK()
+    return state.afkRenderDisabled == true
+end
+
+function api.GetPreset()
+    return CANONICAL_PRESETS[presetKey] or tostring(cfg.Preset or "Balanced")
+end
+
+function api.SetAFK(first, second)
+    if not isActive() then
+        return state.afkRenderDisabled == true
+    end
+    local enabled = unwrapApiArg(first, second) == true
+    state.manualAfk = enabled
+    state.afkToggledManually = true
+    applyAfkMode(
+        (state.manualAfk or state.focusAfk)
+            and "AFK mode ON (3D rendering paused)"
+            or "AFK mode OFF (3D rendering restored)"
+    )
+    return state.afkRenderDisabled == true
+end
+
+function api.ToggleAFK()
+    return api.SetAFK(not state.manualAfk)
+end
+
+function api.SetPreset(first, second)
+    if not isActive() then
+        return nil
+    end
+    local requested = unwrapApiArg(first, second)
+    local nextKey = string.lower(tostring(requested or "balanced"))
+    if not PRESET_OPTIMIZER_OVERRIDES[nextKey] then
+        nextKey = "balanced"
+    end
+
+    presetKey = nextKey
+    presetBase = PRESET_OPTIMIZER_OVERRIDES[presetKey]
+    cfg.Preset = CANONICAL_PRESETS[presetKey]
+    userLoaderCfg.Preset = cfg.Preset
+
+    local nextReplay = buildReplayCode()
+    if nextReplay then
+        replayCode = nextReplay
+        env.__UniversalLoaderReplayCode = replayCode
+    end
+
+    state.manualAfk = (presetKey == "afk")
+    state.afkToggledManually = true
+
+    local finalOpt = buildOptimizerSettings(false)
+    finalOpt.Other["Disable 3D Rendering"] = state.afkRenderDisabled or state.manualAfk
+    if state.manualAfk then
+        finalOpt.Other["FPS Cap"] = cfg.AFKFPSCap
+    end
+
+    applyAfkMode("Preset: " .. cfg.Preset)
+
+    if cfg.LoadOptimizer then
+        writeConfigSlot("Settings", finalOpt)
+        runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer", true)
+        env.__UniversalLoaderOwnedOpt = env.Settings or (_G and _G.Settings)
+    end
+
+    refreshControlPanel()
+    return cfg.Preset
+end
+
+function api.CyclePreset()
+    local current = api.GetPreset()
+    local nextPreset = PRESET_CYCLE[1]
+    for i, name in ipairs(PRESET_CYCLE) do
+        if name == current then
+            nextPreset = PRESET_CYCLE[(i % #PRESET_CYCLE) + 1]
+            break
+        end
+    end
+    return api.SetPreset(nextPreset)
+end
+
+function api.Rejoin(first, second)
+    if not isActive() then
+        return false, "inactive"
+    end
+    local preferSame = unwrapApiArg(first, second) == true
+    local TeleportService = safeGetService("TeleportService")
+    if not TeleportService or not LocalPlayer then
+        return false, "TeleportService unavailable"
+    end
+    local placeId = game and tonumber(game.PlaceId) or 0
+    if placeId <= 0 then
+        return false, "Invalid PlaceId"
+    end
+
+    armTeleportQueueOnce()
+
+    local jobId = game and game.JobId
+    if preferSame and type(jobId) == "string" and jobId ~= "" then
+        local okSame, errSame = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+        end)
+        if okSame then
+            return true
+        end
+        return false, tostring(errSame)
+    end
+
+    local okTp, errTp = pcall(function()
+        TeleportService:Teleport(placeId, LocalPlayer)
+    end)
+    if okTp then
+        return true
+    end
+    return false, tostring(errTp)
+end
+
+function api.ServerHop(first, second)
+    if not isActive() then
+        return false, "inactive"
+    end
+    local preferLowPlayer = unwrapApiArg(first, second) == true
+    local HttpService = safeGetService("HttpService")
+    local TeleportService = safeGetService("TeleportService")
+    if not HttpService or not TeleportService or not LocalPlayer then
+        return false, "Teleport/HttpService unavailable"
+    end
+
+    local placeId = game and tonumber(game.PlaceId) or 0
+    if placeId <= 0 then
+        return false, "Invalid PlaceId"
+    end
+
+    local sortOrder = preferLowPlayer and "Asc" or "Desc"
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100",
+        math.floor(placeId),
+        sortOrder
+    )
+
+    local body, fetchErr = fetchUrl(url)
+    if not body then
+        return false, fetchErr or "Failed to fetch servers"
+    end
+
+    local okDecode, decoded = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+    if not okDecode or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+        return false, "Invalid server list JSON"
+    end
+
+    local currentJobId = game and game.JobId or ""
+    local candidates = {}
+    for _, srv in ipairs(decoded.data) do
+        if type(srv) == "table" and type(srv.id) == "string" and srv.id ~= "" and srv.id ~= currentJobId then
+            local playing = tonumber(srv.playing) or 0
+            local maxPlayers = tonumber(srv.maxPlayers) or math.huge
+            if playing > 0 and playing < maxPlayers then
+                table.insert(candidates, srv)
+            end
+        end
+    end
+
+    if #candidates == 0 then
+        return false, "No open servers found"
+    end
+
+    local chosen = candidates[1]
+    if preferLowPlayer then
+        local lowestCount = tonumber(chosen.playing) or math.huge
+        for i = 2, #candidates do
+            local p = tonumber(candidates[i].playing) or math.huge
+            if p < lowestCount then
+                lowestCount = p
+                chosen = candidates[i]
+            end
+        end
+    else
+        chosen = candidates[math.random(1, #candidates)]
+    end
+
+    armTeleportQueueOnce()
+
+    local okHop, errHop = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, chosen.id, LocalPlayer)
+    end)
+    if okHop then
+        return true, chosen.id
+    end
+    return false, tostring(errHop)
+end
+
+function api.IsPanelVisible()
+    return state.panelVisible == true
+end
+
+function api.SetPanelVisible(first, second)
+    if not isActive() then
+        return false
+    end
+    local visible = unwrapApiArg(first, second) == true
+    state.panelVisible = visible
+    if visible then
+        if not state.panelGui or not state.panelGui.Parent then
+            state.panelGui = createControlPanel()
+        end
+        if state.panelGui then
+            pcall(function()
+                state.panelGui.Enabled = true
+            end)
+            refreshControlPanel()
+        end
+    elseif state.panelGui then
+        pcall(function()
+            state.panelGui.Enabled = false
+        end)
+    end
+    return state.panelVisible
+end
+
+function api.TogglePanel()
+    return api.SetPanelVisible(not state.panelVisible)
+end
+
+function api.Cleanup()
+    state.cleanup()
+end
+api.Stop = api.Cleanup
+
+state.api = api
+env.UniversalLoader = api
+if _G and _G ~= env then
+    _G.UniversalLoader = api
+end
+
+local panelToggleKey = resolveKeyCode(cfg.PanelToggleKey)
+
+-- Arm teleport replay, initial AFK overlay/audio, optional panel, hotkeys & Alt-Tab focus listener
 local queueArmed = armTeleportQueueOnce()
 if state.manualAfk then
     syncAfkAudio(true)
 end
 syncAfkDarkOverlay(state.afkRenderDisabled)
+if cfg.ShowPanel then
+    api.SetPanelVisible(true)
+end
 
 if UserInputService then
-    if toggleKey and UserInputService.InputBegan then
+    if (toggleKey or panelToggleKey) and UserInputService.InputBegan then
         trackConnection(UserInputService.InputBegan, function(input, gameProcessed)
             if not isActive() or gameProcessed or not input then
                 return
             end
-            if input.KeyCode == toggleKey then
-                state.manualAfk = not state.manualAfk
-                state.afkToggledManually = true
-                applyAfkMode(
-                    (state.manualAfk or state.focusAfk)
-                        and "AFK mode ON (3D rendering paused)"
-                        or "AFK mode OFF (3D rendering restored)"
-                )
+            if toggleKey and input.KeyCode == toggleKey then
+                api.ToggleAFK()
+            elseif panelToggleKey and input.KeyCode == panelToggleKey then
+                api.TogglePanel()
             end
         end)
     end
@@ -1019,36 +1618,9 @@ local function runModulesPipeline()
 
     -- 2. Optimizer (runs after Anti-AFK settles, respecting live F8 / Alt-Tab AFK state and MuteAllSounds)
     if cfg.LoadOptimizer and waitStage(cfg.OptimizerDelay) then
-        local userOpt = readUnownedSlot("Settings", "__UniversalLoaderOwnedOpt")
-        local finalOpt = mergeTables(presetBase, cfg.OptimizerSettings)
-        if userOpt then
-            finalOpt = mergeTables(finalOpt, userOpt)
-        end
-        finalOpt.Other = finalOpt.Other or {}
-
-        if cfg.MuteAllSounds then
-            finalOpt.Other["Mute Sounds"] = true
-        end
-
-        local explicitCap = tonumber(finalOpt.Other["FPS Cap"])
-        if explicitCap and explicitCap > 0 and not (state.afkRenderDisabled and (explicitCap == cfg.AFKFPSCap or explicitCap == 15)) then
-            restoredCap = explicitCap
-        end
-
-        if state.afkToggledManually or state.focusAfk then
-            finalOpt.Other["Disable 3D Rendering"] = state.afkRenderDisabled
-            if state.afkRenderDisabled then
-                finalOpt.Other["FPS Cap"] = cfg.AFKFPSCap
-            else
-                finalOpt.Other["FPS Cap"] = (restoredCap ~= 999) and restoredCap or false
-            end
-        elseif finalOpt.Other["Disable 3D Rendering"] ~= nil then
-            state.manualAfk = finalOpt.Other["Disable 3D Rendering"] == true
-            state.afkRenderDisabled = state.manualAfk
-        end
-
+        local finalOpt = buildOptimizerSettings(true)
         writeConfigSlot("Settings", finalOpt)
-        if runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer") then
+        if runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer", true) then
             table.insert(loadedModules, "Optimizer")
         end
         env.__UniversalLoaderOwnedOpt = env.Settings or (_G and _G.Settings)
@@ -1116,3 +1688,5 @@ if cfg.StagedExecution and spawnTask then
 else
     runModulesPipeline()
 end
+
+return api
