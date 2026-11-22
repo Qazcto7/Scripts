@@ -227,8 +227,12 @@ local function setPropSafe(inst, prop, value)
     return pcall(rawAssignProp, inst, prop, value)
 end
 
-local function destroySafe(inst)
-    pcall(DestroyInstance, inst)
+local function readClassName(inst)
+    return inst.ClassName
+end
+
+local function readMaxDistance(inst)
+    return inst.MaxDistance
 end
 
 local function disconnectConn(conn)
@@ -249,6 +253,9 @@ local queueHead = 1
 local queueTail = 0
 local scanThread = nil
 local isCleanedUp = false
+local activeSafeAncestors = nil
+local activeIgnoredAncestors = nil
+local activeCamAncestors = nil
 
 local state = {
     runId = runId,
@@ -291,6 +298,9 @@ state.cleanup = function()
         pcall(cancelTask, scanThread)
     end
     scanThread = nil
+    activeSafeAncestors = nil
+    activeIgnoredAncestors = nil
+    activeCamAncestors = nil
     pendingQueue = {}
     pendingSet = setmetatable({}, { __mode = "k" })
     queueHead = 1
@@ -355,17 +365,40 @@ local applyFFlags = otherCfg["Apply FFlags"] == true
 local disable3DRendering = otherCfg["Disable 3D Rendering"] == true
 local fpsCap = otherCfg["FPS Cap"]
 
--- Weak-keyed caches avoid retaining destroyed models in memory
+local checkPlayers = ignoreMe or ignoreOthers
+local cachedCamera = Workspace.CurrentCamera
+
+-- Weak-keyed cache avoids retaining destroyed character models in memory
 local IgnoredCharacters = setmetatable({}, { __mode = "k" })
-local NonPlayerModels = setmetatable({}, { __mode = "k" })
 
 local function updateCharacterCache(player, char)
     if not char then
         return
     end
-    NonPlayerModels[char] = nil
     local ignore = (player == LocalPlayer and ignoreMe) or (player ~= LocalPlayer and ignoreOthers)
     IgnoredCharacters[char] = ignore or nil
+    if activeSafeAncestors then
+        activeSafeAncestors[char] = nil
+    end
+    if activeIgnoredAncestors then
+        activeIgnoredAncestors[char] = ignore or nil
+    end
+end
+
+local function syncAllPlayerCharacters()
+    if not checkPlayers then
+        return
+    end
+    local okPlrs, existingPlayers = pcall(Players.GetPlayers, Players)
+    if not okPlrs or type(existingPlayers) ~= "table" then
+        return
+    end
+    for i = 1, #existingPlayers do
+        local plr = existingPlayers[i]
+        if plr then
+            updateCharacterCache(plr, plr.Character)
+        end
+    end
 end
 
 local function hookPlayer(player)
@@ -379,6 +412,9 @@ local function hookPlayer(player)
     local function syncCharacter(char)
         if lastChar and lastChar ~= char then
             IgnoredCharacters[lastChar] = nil
+            if activeIgnoredAncestors then
+                activeIgnoredAncestors[lastChar] = nil
+            end
         end
         lastChar = char
         updateCharacterCache(player, char)
@@ -387,6 +423,9 @@ local function hookPlayer(player)
     list[#list + 1] = player.CharacterAdded:Connect(syncCharacter)
     list[#list + 1] = player.CharacterRemoving:Connect(function(char)
         IgnoredCharacters[char] = nil
+        if activeIgnoredAncestors then
+            activeIgnoredAncestors[char] = nil
+        end
         if lastChar == char then
             lastChar = nil
         end
@@ -401,7 +440,7 @@ local function hookPlayer(player)
     end
 end
 
-if ignoreMe or ignoreOthers then
+if checkPlayers then
     local existingPlayers = Players:GetPlayers()
     for i = 1, #existingPlayers do
         hookPlayer(existingPlayers[i])
@@ -410,6 +449,9 @@ if ignoreMe or ignoreOthers then
     trackConnection(Players.PlayerRemoving:Connect(function(player)
         if player.Character then
             IgnoredCharacters[player.Character] = nil
+            if activeIgnoredAncestors then
+                activeIgnoredAncestors[player.Character] = nil
+            end
         end
         disconnectPlayer(player)
     end))
@@ -439,32 +481,22 @@ local CAMERA_PASS_CLASSES = {
     Explosion = true,
 }
 
-local function isIgnored(inst, className)
-    local cam = Workspace.CurrentCamera
-    local node = inst
+local function isIgnoredDynamic(inst, parent, className)
+    if checkPlayers and IgnoredCharacters[inst] then
+        return true
+    end
+    local cam = cachedCamera
+    local node = parent
 
     while node and node ~= Workspace and node ~= Lighting and node ~= game do
-        if cam and node == cam then
+        if ignoreMe and cam and node == cam then
             -- Keep first-person viewmodel meshes/parts/decals intact when Ignore Me is true
-            if ignoreMe and not CAMERA_PASS_CLASSES[className] then
+            if not CAMERA_PASS_CLASSES[className] then
                 return true
             end
         end
-        if (ignoreMe or ignoreOthers) and IgnoredCharacters[node] then
+        if checkPlayers and IgnoredCharacters[node] then
             return true
-        end
-        if (ignoreMe or ignoreOthers) and node.ClassName == "Model" and not NonPlayerModels[node] then
-            local okPlr, plr = pcall(Players.GetPlayerFromCharacter, Players, node)
-            if okPlr and plr then
-                local ignore = (plr == LocalPlayer and ignoreMe) or (plr ~= LocalPlayer and ignoreOthers)
-                if ignore then
-                    IgnoredCharacters[node] = true
-                    return true
-                end
-                return false
-            else
-                NonPlayerModels[node] = true
-            end
         end
         node = node.Parent
     end
@@ -476,207 +508,275 @@ local function isIgnored(inst, className)
     return false
 end
 
--- Per-class handlers (no per-instance closure allocation)
-local function handleMeshPart(inst)
-    if mpDestroy then
-        destroySafe(inst)
+-- Forward-declared unified class dispatch table:
+--   function = active handler
+--   false    = known skipped / disabled class (O(1) single-lookup skip)
+--   nil      = unseen class (resolved lazily once via resolveHandler)
+local CLASS_HANDLERS
+
+-- Capability probes (probe once instead of throwing C++ exceptions on thousands of instances)
+-- meshPartTextureMode: nil = untested, 1 = direct assign, 2 = sethiddenproperty, 0 = unsupported
+local meshPartTextureMode = nil
+local function clearMeshPartTexture(inst)
+    if meshPartTextureMode == 1 then
+        inst.TextureID = ""
+        return
+    elseif meshPartTextureMode == 2 then
+        setHiddenProp(inst, "TextureID", "")
+        return
+    elseif meshPartTextureMode == 0 then
         return
     end
-    if mpInvisible and inst.Transparency ~= 1 then
-        inst.Transparency = 1
-    end
-    if mpLowerQuality then
-        if SMOOTH_PLASTIC and inst.Material ~= SMOOTH_PLASTIC then
-            inst.Material = SMOOTH_PLASTIC
-        end
-        if inst.Reflectance ~= 0 then
-            inst.Reflectance = 0
-        end
-        if inst.TextureID ~= "" then
-            pcall(setPropSafe, inst, "TextureID", "")
-        end
-    end
-    if noShadows and inst.CastShadow then
-        inst.CastShadow = false
-    end
-end
 
--- Note: RenderFidelity on MeshPart and PartOperation/SolidModel is skipped at runtime because Roblox logs "Cannot change SolidModel RenderFidelity during Run-Time" even under pcall.
-local function handleBasePart(inst)
-    if lowQualityParts then
-        if SMOOTH_PLASTIC and inst.Material ~= SMOOTH_PLASTIC then
-            inst.Material = SMOOTH_PLASTIC
-        end
-        if inst.Reflectance ~= 0 then
-            inst.Reflectance = 0
-        end
-    end
-    if noShadows and inst.CastShadow then
-        inst.CastShadow = false
-    end
-end
-
-local function handleMesh(inst)
-    if meshDestroy then
-        destroySafe(inst)
-    elseif meshLowDetail and setHiddenProp and LOW_LOD then
-        pcall(setHiddenProp, inst, "LODX", LOW_LOD)
-        pcall(setHiddenProp, inst, "LODY", LOW_LOD)
-    end
-end
-
-local function handleImage(inst)
-    if imgDestroy then
-        destroySafe(inst)
-    elseif imgInvisible and inst.Transparency ~= 1 then
-        inst.Transparency = 1
-    end
-end
-
-local function handleParticle(inst)
-    if partDestroy then
-        destroySafe(inst)
-    elseif partInvisible and inst.Enabled then
-        inst.Enabled = false
-    end
-end
-
-local function handleBeam(inst)
-    if not noBeams then
+    local okDirect = pcall(rawAssignProp, inst, "TextureID", "")
+    if okDirect then
+        meshPartTextureMode = 1
         return
     end
-    if partDestroy then
-        destroySafe(inst)
-    elseif inst.Enabled then
-        inst.Enabled = false
+    if setHiddenProp then
+        local okHidden = pcall(setHiddenProp, inst, "TextureID", "")
+        if okHidden then
+            meshPartTextureMode = 2
+            return
+        end
+    end
+    if inst.Parent ~= nil then
+        meshPartTextureMode = 0
     end
 end
 
-local function handleExplosion(inst)
-    if expDestroy then
-        destroySafe(inst)
+local meshLodSupported = (not meshDestroy) and meshLowDetail and (setHiddenProp ~= nil) and (LOW_LOD ~= nil)
+local meshLodProbed = false
+local meshLodHasX = false
+local meshLodHasY = false
+
+local function handleMeshLod(inst)
+    if not meshLodSupported then
         return
     end
-    if expInvisible and inst.Visible then
-        inst.Visible = false
+    if not meshLodProbed then
+        local okX = pcall(setHiddenProp, inst, "LODX", LOW_LOD)
+        local okY = pcall(setHiddenProp, inst, "LODY", LOW_LOD)
+        if okX or okY then
+            meshLodProbed = true
+            meshLodHasX = okX
+            meshLodHasY = okY
+        elseif inst.Parent ~= nil then
+            meshLodSupported = false
+            CLASS_HANDLERS.SpecialMesh = false
+            CLASS_HANDLERS.FileMesh = false
+        end
+        return
     end
-    if expSmaller then
-        if inst.BlastPressure ~= 1 then
-            inst.BlastPressure = 1
-        end
-        if inst.BlastRadius ~= 1 then
-            inst.BlastRadius = 1
-        end
+    if meshLodHasX then
+        setHiddenProp(inst, "LODX", LOW_LOD)
+    end
+    if meshLodHasY then
+        setHiddenProp(inst, "LODY", LOW_LOD)
     end
 end
 
-local function handleClothing(inst)
-    if noClothes then
-        destroySafe(inst)
-    end
+-- Specialized per-class hot handlers (constant config branches folded at startup; no per-instance closures or double pcalls)
+local function handleDisableEnabled(inst)
+    inst.Enabled = false
 end
 
-local function handlePostEffect(inst)
-    if noCameraEffects and inst.Enabled then
-        inst.Enabled = false
-    end
-end
-
-local function handleAtmosphere(inst)
-    if noFog or noCameraEffects then
-        if inst.Density ~= 0 then
-            pcall(setPropSafe, inst, "Density", 0)
-        end
-        if inst.Glare ~= 0 then
-            pcall(setPropSafe, inst, "Glare", 0)
-        end
-        if inst.Haze ~= 0 then
-            pcall(setPropSafe, inst, "Haze", 0)
-        end
-    end
-end
-
-local function handleClouds(inst)
-    if noClouds and inst.Enabled then
-        inst.Enabled = false
-    end
+local function handleImageInvisible(inst)
+    inst.Transparency = 1
 end
 
 local function handleLight(inst)
-    if noShadows and inst.Shadows then
-        inst.Shadows = false
-    end
+    inst.Shadows = false
 end
 
-local function handleSurfaceAppearance(inst)
-    if noSurfaceAppearance then
-        destroySafe(inst)
-    end
-end
-
-local function handleHighlight(inst)
-    if noHighlights and inst.Enabled then
-        pcall(setPropSafe, inst, "Enabled", false)
-    end
+local function handleAtmosphere(inst)
+    inst.Density = 0
+    inst.Glare = 0
+    inst.Haze = 0
 end
 
 local function handleVideoFrame(inst)
-    if disableVideoFrames then
-        pcall(function()
-            if inst.Playing then
-                inst.Playing = false
-            end
-            if inst.Visible then
-                inst.Visible = false
-            end
-        end)
-    end
+    inst.Playing = false
+    inst.Visible = false
 end
 
 local function handleSound(inst)
-    if not muteSounds then
-        return
+    inst.Volume = 0
+    inst.Playing = false
+end
+
+local function handleSoundGroup(inst)
+    inst.Volume = 0
+end
+
+-- Note: RenderFidelity on MeshPart and PartOperation/SolidModel is skipped at runtime because Roblox logs "Cannot change SolidModel RenderFidelity during Run-Time" even under pcall.
+local handleBasePart = false
+if lowQualityParts and SMOOTH_PLASTIC and noShadows then
+    handleBasePart = function(inst)
+        inst.Material = SMOOTH_PLASTIC
+        if inst.Reflectance ~= 0 then
+            inst.Reflectance = 0
+        end
+        inst.CastShadow = false
     end
-    local okVol, vol = pcall(function()
-        return inst.Volume
-    end)
-    if okVol and type(vol) == "number" and vol ~= 0 then
-        setPropSafe(inst, "Volume", 0)
+elseif lowQualityParts and SMOOTH_PLASTIC then
+    handleBasePart = function(inst)
+        inst.Material = SMOOTH_PLASTIC
+        if inst.Reflectance ~= 0 then
+            inst.Reflectance = 0
+        end
     end
-    local okPlay, playing = pcall(function()
-        return inst.Playing
-    end)
-    if okPlay and playing == true then
-        setPropSafe(inst, "Playing", false)
+elseif lowQualityParts and noShadows then
+    handleBasePart = function(inst)
+        if inst.Reflectance ~= 0 then
+            inst.Reflectance = 0
+        end
+        inst.CastShadow = false
+    end
+elseif lowQualityParts then
+    handleBasePart = function(inst)
+        if inst.Reflectance ~= 0 then
+            inst.Reflectance = 0
+        end
+    end
+elseif noShadows then
+    handleBasePart = function(inst)
+        inst.CastShadow = false
     end
 end
 
-local function handleWorldUI(inst)
-    if disableWorldUI then
-        if inst.Enabled then
-            pcall(setPropSafe, inst, "Enabled", false)
+local handleMeshPart = false
+if mpDestroy then
+    handleMeshPart = DestroyInstance
+elseif mpInvisible or mpLowerQuality or noShadows then
+    handleMeshPart = function(inst)
+        if mpInvisible then
+            inst.Transparency = 1
         end
-        return
-    end
-    if optimizeWorldUI == true then
-        local okDist, dist = pcall(function()
-            return inst.MaxDistance
-        end)
-        if okDist and type(dist) == "number" and (dist == 0 or dist > maxWorldUIDistance) then
-            pcall(setPropSafe, inst, "MaxDistance", maxWorldUIDistance)
-        end
-        if lowRendering or lowQualityParts then
-            local okLight, li = pcall(function()
-                return inst.LightInfluence
-            end)
-            if okLight and type(li) == "number" and li ~= 0 then
-                pcall(setPropSafe, inst, "LightInfluence", 0)
+        if mpLowerQuality then
+            if SMOOTH_PLASTIC then
+                inst.Material = SMOOTH_PLASTIC
+            end
+            if inst.Reflectance ~= 0 then
+                inst.Reflectance = 0
+            end
+            if meshPartTextureMode ~= 0 then
+                local tid = inst.TextureID
+                if tid and tid ~= "" then
+                    clearMeshPartTexture(inst)
+                end
             end
         end
+        if noShadows then
+            inst.CastShadow = false
+        end
     end
 end
 
-local CLASS_HANDLERS = {
+local handleSpecialMesh = false
+local handlePrimitiveMesh = false
+if meshDestroy then
+    handleSpecialMesh = DestroyInstance
+    handlePrimitiveMesh = DestroyInstance
+elseif meshLodSupported then
+    -- Only SpecialMesh/FileMesh expose LODX/LODY; BlockMesh/CylinderMesh skip immediately
+    handleSpecialMesh = handleMeshLod
+end
+
+local handleImage = false
+if imgDestroy then
+    handleImage = DestroyInstance
+elseif imgInvisible then
+    handleImage = handleImageInvisible
+end
+
+local handleParticle = false
+if partDestroy then
+    handleParticle = DestroyInstance
+elseif partInvisible then
+    handleParticle = handleDisableEnabled
+end
+
+local handleBeam = false
+if noBeams then
+    handleBeam = partDestroy and DestroyInstance or handleDisableEnabled
+end
+
+local handleExplosion = false
+if expDestroy then
+    handleExplosion = DestroyInstance
+elseif expInvisible and expSmaller then
+    handleExplosion = function(inst)
+        inst.Visible = false
+        inst.BlastPressure = 1
+        inst.BlastRadius = 1
+    end
+elseif expInvisible then
+    handleExplosion = function(inst)
+        inst.Visible = false
+    end
+elseif expSmaller then
+    handleExplosion = function(inst)
+        inst.BlastPressure = 1
+        inst.BlastRadius = 1
+    end
+end
+
+local handleClothing = noClothes and DestroyInstance or false
+local handleSurfaceAppearance = noSurfaceAppearance and DestroyInstance or false
+local handleHighlight = noHighlights and handleDisableEnabled or false
+local handleVideo = disableVideoFrames and handleVideoFrame or false
+local handleSoundActive = muteSounds and handleSound or false
+local handleSoundGroupActive = muteSounds and handleSoundGroup or false
+local handlePostEffect = noCameraEffects and handleDisableEnabled or false
+local handleAtmosphereActive = (noFog or noCameraEffects) and handleAtmosphere or false
+local handleCloudsActive = noClouds and handleDisableEnabled or false
+local handleLightActive = noShadows and handleLight or false
+
+local handleBillboardUI = false
+local handleSurfaceUI = false
+local worldUILightZero = lowRendering or lowQualityParts
+local surfaceGuiHasMaxDist = nil -- nil = untested, true/false after first SurfaceGui
+
+if disableWorldUI then
+    handleBillboardUI = handleDisableEnabled
+    handleSurfaceUI = handleDisableEnabled
+elseif optimizeWorldUI == true then
+    handleBillboardUI = function(inst)
+        local dist = inst.MaxDistance
+        if dist == 0 or dist > maxWorldUIDistance then
+            inst.MaxDistance = maxWorldUIDistance
+        end
+        if worldUILightZero then
+            inst.LightInfluence = 0
+        end
+    end
+    handleSurfaceUI = function(inst)
+        if surfaceGuiHasMaxDist ~= false then
+            if surfaceGuiHasMaxDist == true then
+                local dist = inst.MaxDistance
+                if dist == 0 or dist > maxWorldUIDistance then
+                    inst.MaxDistance = maxWorldUIDistance
+                end
+            else
+                local okDist, dist = pcall(readMaxDistance, inst)
+                if okDist and type(dist) == "number" then
+                    surfaceGuiHasMaxDist = true
+                    if dist == 0 or dist > maxWorldUIDistance then
+                        setPropSafe(inst, "MaxDistance", maxWorldUIDistance)
+                    end
+                elseif inst.Parent ~= nil then
+                    surfaceGuiHasMaxDist = false
+                end
+            end
+        end
+        if worldUILightZero then
+            inst.LightInfluence = 0
+        end
+    end
+end
+
+CLASS_HANDLERS = {
     MeshPart = handleMeshPart,
 
     PartOperation = handleBasePart,
@@ -694,10 +794,10 @@ local CLASS_HANDLERS = {
     FlagStand = handleBasePart,
     SkateboardPlatform = handleBasePart,
 
-    SpecialMesh = handleMesh,
-    BlockMesh = handleMesh,
-    CylinderMesh = handleMesh,
-    FileMesh = handleMesh,
+    SpecialMesh = handleSpecialMesh,
+    FileMesh = handleSpecialMesh,
+    BlockMesh = handlePrimitiveMesh,
+    CylinderMesh = handlePrimitiveMesh,
 
     Decal = handleImage,
     Texture = handleImage,
@@ -719,11 +819,11 @@ local CLASS_HANDLERS = {
 
     SurfaceAppearance = handleSurfaceAppearance,
     Highlight = handleHighlight,
-    VideoFrame = handleVideoFrame,
-    Sound = handleSound,
-    SoundGroup = handleSound,
-    BillboardGui = handleWorldUI,
-    SurfaceGui = handleWorldUI,
+    VideoFrame = handleVideo,
+    Sound = handleSoundActive,
+    SoundGroup = handleSoundGroupActive,
+    BillboardGui = handleBillboardUI,
+    SurfaceGui = handleSurfaceUI,
 
     BloomEffect = handlePostEffect,
     BlurEffect = handlePostEffect,
@@ -731,180 +831,158 @@ local CLASS_HANDLERS = {
     DepthOfFieldEffect = handlePostEffect,
     SunRaysEffect = handlePostEffect,
 
-    Atmosphere = handleAtmosphere,
-    Clouds = handleClouds,
+    Atmosphere = handleAtmosphereActive,
+    Clouds = handleCloudsActive,
 
-    PointLight = handleLight,
-    SpotLight = handleLight,
-    SurfaceLight = handleLight,
-}
+    PointLight = handleLightActive,
+    SpotLight = handleLightActive,
+    SurfaceLight = handleLightActive,
 
-local SKIP_CLASSES = {
-    Folder = true,
-    Model = true,
-    Configuration = true,
-    Attachment = true,
-    Weld = true,
-    WeldConstraint = true,
-    ManualWeld = true,
-    Snap = true,
-    Motor = true,
-    Motor6D = true,
-    Rotate = true,
-    Glue = true,
-    BallSocketConstraint = true,
-    HingeConstraint = true,
-    PrismaticConstraint = true,
-    RodConstraint = true,
-    RopeConstraint = true,
-    SpringConstraint = true,
-    AlignPosition = true,
-    AlignOrientation = true,
-    LinearVelocity = true,
-    AngularVelocity = true,
-    VectorForce = true,
-    Torque = true,
-    LineForce = true,
-    Script = true,
-    LocalScript = true,
-    ModuleScript = true,
-    RemoteEvent = true,
-    RemoteFunction = true,
-    BindableEvent = true,
-    BindableFunction = true,
-    Sound = not muteSounds,
-    SoundGroup = not muteSounds,
-    ClickDetector = true,
-    ProximityPrompt = true,
-    Humanoid = true,
-    Animator = true,
-    Animation = true,
-    AnimationController = true,
-    Tool = true,
-    HopperBin = true,
-    ForceField = true,
-    Accessory = true,
-    Hat = true,
-    BodyColors = true,
-    CharacterMesh = true,
-    NumberValue = true,
-    IntValue = true,
-    BoolValue = true,
-    StringValue = true,
-    ObjectValue = true,
-    CFrameValue = true,
-    Vector3Value = true,
-    Color3Value = true,
-    BrickColorValue = true,
-    RayValue = true,
-    Camera = true,
-    Terrain = true,
-    Sky = true,
-    Frame = true,
-    TextLabel = true,
-    TextButton = true,
-    TextBox = true,
-    ImageLabel = true,
-    ImageButton = true,
-    ScrollingFrame = true,
-    UIListLayout = true,
-    UIGridLayout = true,
-    UICorner = true,
-    UIPadding = true,
-    UIStroke = true,
-    UIAspectRatioConstraint = true,
-    UISizeConstraint = true,
+    -- Common non-optimizable classes mapped directly to false for O(1) single-table skip
+    Folder = false,
+    Model = false,
+    Configuration = false,
+    Attachment = false,
+    Weld = false,
+    WeldConstraint = false,
+    ManualWeld = false,
+    Snap = false,
+    Motor = false,
+    Motor6D = false,
+    Rotate = false,
+    Glue = false,
+    BallSocketConstraint = false,
+    HingeConstraint = false,
+    PrismaticConstraint = false,
+    RodConstraint = false,
+    RopeConstraint = false,
+    SpringConstraint = false,
+    AlignPosition = false,
+    AlignOrientation = false,
+    LinearVelocity = false,
+    AngularVelocity = false,
+    VectorForce = false,
+    Torque = false,
+    LineForce = false,
+    Script = false,
+    LocalScript = false,
+    ModuleScript = false,
+    RemoteEvent = false,
+    RemoteFunction = false,
+    BindableEvent = false,
+    BindableFunction = false,
+    ClickDetector = false,
+    ProximityPrompt = false,
+    Humanoid = false,
+    Animator = false,
+    Animation = false,
+    AnimationController = false,
+    Tool = false,
+    HopperBin = false,
+    ForceField = false,
+    Accessory = false,
+    Hat = false,
+    BodyColors = false,
+    CharacterMesh = false,
+    NumberValue = false,
+    IntValue = false,
+    BoolValue = false,
+    StringValue = false,
+    ObjectValue = false,
+    CFrameValue = false,
+    Vector3Value = false,
+    Color3Value = false,
+    BrickColorValue = false,
+    RayValue = false,
+    Camera = false,
+    Terrain = false,
+    Sky = false,
+    Frame = false,
+    TextLabel = false,
+    TextButton = false,
+    TextBox = false,
+    ImageLabel = false,
+    ImageButton = false,
+    ScrollingFrame = false,
+    UIListLayout = false,
+    UIGridLayout = false,
+    UICorner = false,
+    UIPadding = false,
+    UIStroke = false,
+    UIAspectRatioConstraint = false,
+    UISizeConstraint = false,
 }
 
 local function resolveHandler(inst, className)
+    local resolved = false
     if inst:IsA("Terrain") then
-        SKIP_CLASSES[className] = true
-        return nil
+        resolved = false
     elseif inst:IsA("MeshPart") then
-        CLASS_HANDLERS[className] = handleMeshPart
-        return handleMeshPart
+        resolved = handleMeshPart
     elseif inst:IsA("BasePart") then
-        CLASS_HANDLERS[className] = handleBasePart
-        return handleBasePart
+        resolved = handleBasePart
     elseif inst:IsA("DataModelMesh") then
-        CLASS_HANDLERS[className] = handleMesh
-        return handleMesh
+        resolved = (inst:IsA("SpecialMesh") or inst:IsA("FileMesh")) and handleSpecialMesh or handlePrimitiveMesh
     elseif inst:IsA("FaceInstance") then
-        CLASS_HANDLERS[className] = handleImage
-        return handleImage
+        resolved = handleImage
     elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Smoke") or inst:IsA("Fire") or inst:IsA("Sparkles") then
-        CLASS_HANDLERS[className] = handleParticle
         CAMERA_PASS_CLASSES[className] = true
-        return handleParticle
+        resolved = handleParticle
     elseif inst:IsA("Beam") then
-        CLASS_HANDLERS[className] = handleBeam
-        return handleBeam
+        resolved = handleBeam
     elseif inst:IsA("Explosion") then
-        CLASS_HANDLERS[className] = handleExplosion
         CAMERA_PASS_CLASSES[className] = true
-        return handleExplosion
+        resolved = handleExplosion
     elseif inst:IsA("Clothing") or inst:IsA("ShirtGraphic") or inst:IsA("WrapLayer") or inst:IsA("WrapTarget") then
-        CLASS_HANDLERS[className] = handleClothing
-        return handleClothing
+        resolved = handleClothing
     elseif inst:IsA("PostEffect") then
-        CLASS_HANDLERS[className] = handlePostEffect
         LIGHTING_CLASSES[className] = true
         CAMERA_PASS_CLASSES[className] = true
-        return handlePostEffect
+        resolved = handlePostEffect
     elseif inst:IsA("Atmosphere") then
-        CLASS_HANDLERS[className] = handleAtmosphere
         LIGHTING_CLASSES[className] = true
-        return handleAtmosphere
+        resolved = handleAtmosphereActive
     elseif inst:IsA("Clouds") then
-        CLASS_HANDLERS[className] = handleClouds
         LIGHTING_CLASSES[className] = true
-        return handleClouds
+        resolved = handleCloudsActive
     elseif inst:IsA("Light") then
-        CLASS_HANDLERS[className] = handleLight
-        return handleLight
+        resolved = handleLightActive
     elseif inst:IsA("Highlight") then
-        CLASS_HANDLERS[className] = handleHighlight
-        return handleHighlight
+        resolved = handleHighlight
     elseif inst:IsA("SurfaceAppearance") then
-        CLASS_HANDLERS[className] = handleSurfaceAppearance
-        return handleSurfaceAppearance
-    elseif inst:IsA("BillboardGui") or inst:IsA("SurfaceGui") then
-        CLASS_HANDLERS[className] = handleWorldUI
-        return handleWorldUI
+        resolved = handleSurfaceAppearance
+    elseif inst:IsA("BillboardGui") then
+        resolved = handleBillboardUI
+    elseif inst:IsA("SurfaceGui") then
+        resolved = handleSurfaceUI
     elseif inst:IsA("VideoFrame") then
-        CLASS_HANDLERS[className] = handleVideoFrame
-        return handleVideoFrame
-    elseif inst:IsA("Sound") or inst:IsA("SoundGroup") then
-        if muteSounds then
-            CLASS_HANDLERS[className] = handleSound
-            return handleSound
-        end
-        SKIP_CLASSES[className] = true
-        return nil
+        resolved = handleVideo
+    elseif inst:IsA("Sound") then
+        resolved = handleSoundActive
+    elseif inst:IsA("SoundGroup") then
+        resolved = handleSoundGroupActive
     end
 
-    SKIP_CLASSES[className] = true
-    return nil
+    CLASS_HANDLERS[className] = resolved
+    return resolved
 end
 
 local function optimizeInstanceUnsafe(inst)
-    if not inst or not inst.Parent then
-        return false
-    end
     local className = inst.ClassName
-    if SKIP_CLASSES[className] then
+    local handler = CLASS_HANDLERS[className]
+    if handler == nil then
+        handler = resolveHandler(inst, className)
+    end
+    if not handler then
         return false
     end
 
-    local handler = CLASS_HANDLERS[className]
-    if not handler then
-        handler = resolveHandler(inst, className)
-        if not handler then
-            return false
-        end
+    local parent = inst.Parent
+    if not parent then
+        return false
     end
 
-    if isIgnored(inst, className) then
+    if isIgnoredDynamic(inst, parent, className) then
         return false
     end
 
@@ -925,16 +1003,16 @@ local function applyTerrainSettings(terrain)
         return
     end
     if lowWater then
-        pcall(setPropSafe, terrain, "WaterWaveSize", 0)
-        pcall(setPropSafe, terrain, "WaterWaveSpeed", 0)
-        pcall(setPropSafe, terrain, "WaterReflectance", 0)
-        pcall(setPropSafe, terrain, "WaterTransparency", 0)
+        setPropSafe(terrain, "WaterWaveSize", 0)
+        setPropSafe(terrain, "WaterWaveSpeed", 0)
+        setPropSafe(terrain, "WaterReflectance", 0)
+        setPropSafe(terrain, "WaterTransparency", 0)
     end
     if (lowWater or lowQualityParts) and setHiddenProp then
         pcall(setHiddenProp, terrain, "Decoration", false)
     end
     if noShadows then
-        pcall(setPropSafe, terrain, "CastShadow", false)
+        setPropSafe(terrain, "CastShadow", false)
     end
 end
 
@@ -946,8 +1024,8 @@ end
 
 local function applyGlobalSettings()
     if noShadows then
-        pcall(setPropSafe, Lighting, "GlobalShadows", false)
-        pcall(setPropSafe, Lighting, "ShadowSoftness", 0)
+        setPropSafe(Lighting, "GlobalShadows", false)
+        setPropSafe(Lighting, "ShadowSoftness", 0)
         if setHiddenProp and VOXEL_TECH then
             pcall(setHiddenProp, Lighting, "Technology", VOXEL_TECH)
         end
@@ -955,14 +1033,14 @@ local function applyGlobalSettings()
     end
 
     if noFog then
-        pcall(setPropSafe, Lighting, "FogEnd", 9e9)
+        setPropSafe(Lighting, "FogEnd", 9e9)
     end
 
     if lowQualityParts or lowRendering then
-        pcall(setPropSafe, Lighting, "EnvironmentSpecularScale", 0)
-        pcall(setPropSafe, Lighting, "EnvironmentDiffuseScale", 0)
+        setPropSafe(Lighting, "EnvironmentSpecularScale", 0)
+        setPropSafe(Lighting, "EnvironmentDiffuseScale", 0)
         if MaterialService then
-            pcall(setPropSafe, MaterialService, "Use2022Materials", false)
+            setPropSafe(MaterialService, "Use2022Materials", false)
         end
     end
 
@@ -971,16 +1049,16 @@ local function applyGlobalSettings()
             local rs = settings().Rendering
             if LOW_RENDER_QUALITY then
                 rs.QualityLevel = LOW_RENDER_QUALITY
-                pcall(setPropSafe, rs, "EditQualityLevel", LOW_RENDER_QUALITY)
+                setPropSafe(rs, "EditQualityLevel", LOW_RENDER_QUALITY)
             end
             if LOW_MESH_DETAIL then
-                pcall(setPropSafe, rs, "MeshPartDetailLevel", LOW_MESH_DETAIL)
+                setPropSafe(rs, "MeshPartDetailLevel", LOW_MESH_DETAIL)
             end
         end)
         pcall(function()
             local gs = UserSettings():GetService("UserGameSettings")
             if gs and SAVED_LOW_QUALITY then
-                pcall(setPropSafe, gs, "SavedQualityLevel", SAVED_LOW_QUALITY)
+                setPropSafe(gs, "SavedQualityLevel", SAVED_LOW_QUALITY)
             end
         end)
         applyFFlag("FFlagDisablePostFx", "True")
@@ -997,15 +1075,15 @@ local function applyGlobalSettings()
         pcall(function()
             local ps = settings().Physics
             if ps then
-                pcall(setPropSafe, ps, "AllowSleep", true)
+                setPropSafe(ps, "AllowSleep", true)
                 local throttleEnum = resolvePhysicsThrottleEnum(physicsThrottle)
                 if throttleEnum then
-                    pcall(setPropSafe, ps, "PhysicsEnvironmentalThrottle", throttleEnum)
+                    setPropSafe(ps, "PhysicsEnvironmentalThrottle", throttleEnum)
                 end
             end
         end)
         if INTERPOLATION_ENABLED then
-            pcall(setPropSafe, Workspace, "InterpolationThrottling", INTERPOLATION_ENABLED)
+            setPropSafe(Workspace, "InterpolationThrottling", INTERPOLATION_ENABLED)
         end
     end
 
@@ -1013,7 +1091,7 @@ local function applyGlobalSettings()
         pcall(function()
             local ns = settings().Network
             if ns then
-                pcall(setPropSafe, ns, "IncomingReplicationLag", 0)
+                setPropSafe(ns, "IncomingReplicationLag", 0)
             end
         end)
         applyFFlag("FFlagOptimizeNetworkTransport", "True")
@@ -1024,7 +1102,7 @@ local function applyGlobalSettings()
         pcall(function()
             local gs = UserSettings():GetService("UserGameSettings")
             if gs then
-                pcall(setPropSafe, gs, "MasterVolume", 0)
+                setPropSafe(gs, "MasterVolume", 0)
             end
         end)
     end
@@ -1079,17 +1157,15 @@ end
 -- Dynamic optimization queue with strict per-frame time budget
 local INITIAL_FRAME_BUDGET = 0.004 -- 4ms per frame during initial pass
 local DYNAMIC_FRAME_BUDGET = 0.002 -- 2ms per frame during gameplay
-
-local function isSkippableQuick(inst)
-    return not inst or SKIP_CLASSES[inst.ClassName]
-end
+local SLICE_BATCH = 256
+local clock = os.clock
 
 local function enqueueInstance(inst)
-    if not isActive() or not inst then
+    if isCleanedUp or not inst then
         return
     end
-    local ok, skip = pcall(isSkippableQuick, inst)
-    if not ok or skip then
+    local ok, className = pcall(readClassName, inst)
+    if not ok or CLASS_HANDLERS[className] == false then
         return
     end
     if not pendingSet[inst] then
@@ -1099,32 +1175,59 @@ local function enqueueInstance(inst)
     end
 end
 
-if dynamicOptimize then
-    trackConnection(Workspace.DescendantAdded:Connect(enqueueInstance))
-    trackConnection(Lighting.DescendantAdded:Connect(enqueueInstance))
+local function enqueueLightingInstance(inst)
+    if isCleanedUp or not inst then
+        return
+    end
+    local ok, className = pcall(readClassName, inst)
+    if not ok then
+        return
+    end
+    local handler = CLASS_HANDLERS[className]
+    if handler == false or (handler ~= nil and not LIGHTING_CLASSES[className]) then
+        return
+    end
+    if not pendingSet[inst] then
+        pendingSet[inst] = true
+        queueTail = queueTail + 1
+        pendingQueue[queueTail] = inst
+    end
+end
 
-    if type(Workspace.GetPropertyChangedSignal) == "function" then
-        local ok, sig = pcall(Workspace.GetPropertyChangedSignal, Workspace, "CurrentCamera")
-        if ok and sig then
-            trackConnection(sig:Connect(function()
-                local cam = Workspace.CurrentCamera
-                if cam then
-                    local okDesc, camDescendants = pcall(cam.GetDescendants, cam)
-                    if okDesc and type(camDescendants) == "table" then
-                        for i = 1, #camDescendants do
-                            enqueueInstance(camDescendants[i])
-                        end
+-- Keep cachedCamera synchronized even if dynamicOptimize is disabled
+if type(Workspace.GetPropertyChangedSignal) == "function" then
+    local ok, sig = pcall(Workspace.GetPropertyChangedSignal, Workspace, "CurrentCamera")
+    if ok and sig then
+        trackConnection(sig:Connect(function()
+            local cam = Workspace.CurrentCamera
+            cachedCamera = cam
+            if activeCamAncestors then
+                activeCamAncestors = cam and { [cam] = true } or {}
+            end
+            if activeSafeAncestors then
+                activeSafeAncestors = { [Workspace] = true }
+            end
+            if dynamicOptimize and cam and isActive() then
+                local okDesc, camDescendants = pcall(cam.GetDescendants, cam)
+                if okDesc and type(camDescendants) == "table" then
+                    for i = 1, #camDescendants do
+                        enqueueInstance(camDescendants[i])
                     end
                 end
-            end))
-        end
+            end
+        end))
     end
+end
+
+if dynamicOptimize then
+    trackConnection(Workspace.DescendantAdded:Connect(enqueueInstance))
+    trackConnection(Lighting.DescendantAdded:Connect(enqueueLightingInstance))
 
     trackConnection(RunService.Heartbeat:Connect(function()
-        if not isActive() or queueHead > queueTail then
+        if isCleanedUp or queueHead > queueTail or not isActive() then
             return
         end
-        local sliceStart = os.clock()
+        local sliceStart = clock()
         local processed = 0
         while queueHead <= queueTail do
             local inst = pendingQueue[queueHead]
@@ -1135,7 +1238,7 @@ if dynamicOptimize then
                 optimizeInstance(inst)
             end
             processed = processed + 1
-            if processed % 64 == 0 and (os.clock() - sliceStart) >= DYNAMIC_FRAME_BUDGET then
+            if processed % 64 == 0 and (clock() - sliceStart) >= DYNAMIC_FRAME_BUDGET then
                 break
             end
         end
@@ -1154,33 +1257,217 @@ local function scanContainer(container, budget)
         return 0, 0, 0
     end
     local total = #descendants
+    if total == 0 then
+        return 0, 0, 0
+    end
+
+    local isLighting = (container == Lighting)
     local optimized = 0
     local workTime = 0
-    local sliceStart = os.clock()
 
-    for i = 1, total do
-        if not isActive() then
-            return total, optimized, workTime
+    local safeAncestors = nil
+    local ignoredAncestors = nil
+    local camAncestors = nil
+    local ancestorTrail = nil
+
+    if not isLighting and checkPlayers then
+        syncAllPlayerCharacters()
+        safeAncestors = { [Workspace] = true }
+        ignoredAncestors = {}
+        for char in pairs(IgnoredCharacters) do
+            ignoredAncestors[char] = true
         end
-        local inst = descendants[i]
-        if inst and optimizeInstance(inst) then
-            optimized = optimized + 1
+        camAncestors = {}
+        cachedCamera = Workspace.CurrentCamera
+        if cachedCamera then
+            camAncestors[cachedCamera] = true
         end
-        if i % 256 == 0 then
-            local now = os.clock()
-            local elapsed = now - sliceStart
-            if elapsed >= budget then
-                workTime = workTime + elapsed
-                waitTask()
-                if not isActive() then
-                    return total, optimized, workTime
+        activeSafeAncestors = safeAncestors
+        activeIgnoredAncestors = ignoredAncestors
+        activeCamAncestors = camAncestors
+        ancestorTrail = {}
+    end
+
+    local function clearTrail(count)
+        for k = 1, count do
+            ancestorTrail[k] = nil
+        end
+    end
+
+    local function resolveAncestorIgnored(parent, className)
+        local trailCount = 0
+        local node = parent
+        local verdict = -1 -- -1 = detached, 0 = safe, 1 = ignored, 2 = camera
+        while node do
+            if safeAncestors[node] or node == Workspace or node == game then
+                verdict = 0
+                break
+            end
+            if ignoredAncestors[node] or IgnoredCharacters[node] then
+                verdict = 1
+                break
+            end
+            if cachedCamera and (node == cachedCamera or camAncestors[node]) then
+                verdict = 2
+                break
+            end
+            if node == Lighting then
+                clearTrail(trailCount)
+                return not LIGHTING_CLASSES[className]
+            end
+            trailCount = trailCount + 1
+            ancestorTrail[trailCount] = node
+            node = node.Parent
+        end
+
+        if verdict == 0 then
+            for k = 1, trailCount do
+                safeAncestors[ancestorTrail[k]] = true
+                ancestorTrail[k] = nil
+            end
+            return false
+        elseif verdict == 1 then
+            for k = 1, trailCount do
+                ignoredAncestors[ancestorTrail[k]] = true
+                ancestorTrail[k] = nil
+            end
+            return true
+        elseif verdict == 2 then
+            for k = 1, trailCount do
+                camAncestors[ancestorTrail[k]] = true
+                ancestorTrail[k] = nil
+            end
+            return ignoreMe and not CAMERA_PASS_CLASSES[className]
+        end
+
+        clearTrail(trailCount)
+        return true
+    end
+
+    local chunkStart = 1
+    local chunkIdx = 1
+    local processChunk
+
+    if isLighting then
+        processChunk = function(stopIdx)
+            for j = chunkStart, stopIdx do
+                chunkIdx = j
+                local inst = descendants[j]
+                if inst then
+                    local className = inst.ClassName
+                    local handler = CLASS_HANDLERS[className]
+                    if handler == nil then
+                        handler = resolveHandler(inst, className)
+                    end
+                    if handler and LIGHTING_CLASSES[className] and inst.Parent then
+                        handler(inst)
+                        optimized = optimized + 1
+                    end
                 end
-                sliceStart = os.clock()
+            end
+        end
+    elseif checkPlayers then
+        processChunk = function(stopIdx)
+            for j = chunkStart, stopIdx do
+                chunkIdx = j
+                local inst = descendants[j]
+                if inst then
+                    local className = inst.ClassName
+                    local handler = CLASS_HANDLERS[className]
+                    if handler == nil then
+                        handler = resolveHandler(inst, className)
+                    end
+                    if handler then
+                        local parent = inst.Parent
+                        if parent and not IgnoredCharacters[inst] then
+                            if safeAncestors[parent] then
+                                handler(inst)
+                                optimized = optimized + 1
+                            elseif ignoredAncestors[parent] then
+                                -- Ignored character descendant
+                            elseif ignoreMe and camAncestors[parent] then
+                                if CAMERA_PASS_CLASSES[className] then
+                                    handler(inst)
+                                    optimized = optimized + 1
+                                end
+                            elseif not resolveAncestorIgnored(parent, className) then
+                                handler(inst)
+                                optimized = optimized + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    else
+        processChunk = function(stopIdx)
+            for j = chunkStart, stopIdx do
+                chunkIdx = j
+                local inst = descendants[j]
+                if inst then
+                    local className = inst.ClassName
+                    local handler = CLASS_HANDLERS[className]
+                    if handler == nil then
+                        handler = resolveHandler(inst, className)
+                    end
+                    if handler and inst.Parent then
+                        handler(inst)
+                        optimized = optimized + 1
+                    end
+                end
             end
         end
     end
 
-    workTime = workTime + (os.clock() - sliceStart)
+    local sliceStart = clock()
+    local i = 1
+    while i <= total do
+        local stopIdx = i + SLICE_BATCH - 1
+        if stopIdx > total then
+            stopIdx = total
+        end
+        chunkStart = i
+        chunkIdx = i
+        local ok = pcall(processChunk, stopIdx)
+        if ok then
+            i = stopIdx + 1
+        else
+            if ancestorTrail then
+                for k = 1, #ancestorTrail do
+                    ancestorTrail[k] = nil
+                end
+            end
+            i = (chunkIdx >= chunkStart and chunkIdx or chunkStart) + 1
+        end
+
+        local now = clock()
+        local elapsed = now - sliceStart
+        if elapsed >= budget then
+            workTime = workTime + elapsed
+            waitTask()
+            if not isActive() then
+                if not isLighting and checkPlayers then
+                    activeSafeAncestors = nil
+                    activeIgnoredAncestors = nil
+                    activeCamAncestors = nil
+                end
+                return total, optimized, workTime
+            end
+            if not isLighting and checkPlayers then
+                safeAncestors = activeSafeAncestors or safeAncestors
+                ignoredAncestors = activeIgnoredAncestors or ignoredAncestors
+                camAncestors = activeCamAncestors or camAncestors
+            end
+            sliceStart = clock()
+        end
+    end
+
+    workTime = workTime + (clock() - sliceStart)
+    if not isLighting and checkPlayers then
+        activeSafeAncestors = nil
+        activeIgnoredAncestors = nil
+        activeCamAncestors = nil
+    end
     return total, optimized, workTime
 end
 
@@ -1191,8 +1478,8 @@ if okLightChildren and type(lightingChildren) == "table" then
         optimizeInstance(lightingChildren[i])
     end
 end
-if Workspace.CurrentCamera then
-    local okCamDesc, camDescendants = pcall(Workspace.CurrentCamera.GetDescendants, Workspace.CurrentCamera)
+if cachedCamera then
+    local okCamDesc, camDescendants = pcall(cachedCamera.GetDescendants, cachedCamera)
     if okCamDesc and type(camDescendants) == "table" then
         for i = 1, #camDescendants do
             optimizeInstance(camDescendants[i])
