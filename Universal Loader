@@ -835,6 +835,12 @@ local function stopOverlayTimer()
     state.afkStartedAt = nil
 end
 
+local function refreshControlPanel()
+    if type(state.panelRefreshFn) == "function" then
+        pcall(state.panelRefreshFn)
+    end
+end
+
 local function startOverlayTimer()
     state.afkStartedAt = state.afkStartedAt or clockNow()
     updateOverlayStatusLabel()
@@ -845,7 +851,9 @@ local function startOverlayTimer()
         local stuckTicks = 0
         while isActive() and state.afkRenderDisabled and state.afkOverlay do
             local beforeTick = clockNow()
-            waitTask(1)
+            local curElapsed = math.max(0, beforeTick - (state.afkStartedAt or beforeTick))
+            local sleepSec = math.max(0.25, 1.02 - (curElapsed % 1))
+            waitTask(sleepSec)
             if not isActive() or not state.afkRenderDisabled or not state.afkOverlay then
                 break
             end
@@ -859,6 +867,16 @@ local function startOverlayTimer()
                 stuckTicks = 0
             end
             updateOverlayStatusLabel()
+            refreshControlPanel()
+            -- Pulse 1 frame with 3D rendering enabled so Wine/DXVK SwapChain presents the updated timer & UI text
+            if RunService and type(RunService.Set3dRenderingEnabled) == "function" and state.afkRenderDisabled then
+                local pulseRev = state.afkRevision
+                pcall(RunService.Set3dRenderingEnabled, RunService, true)
+                waitTask()
+                if isActive() and state.afkRenderDisabled and state.afkOverlay and state.afkRevision == pulseRev then
+                    pcall(RunService.Set3dRenderingEnabled, RunService, false)
+                end
+            end
         end
         state.overlayThread = nil
     end)
@@ -1036,12 +1054,6 @@ local function syncAfkDarkOverlay(enabled)
             state.afkOverlay.Enabled = true
         end)
         startOverlayTimer()
-    end
-end
-
-local function refreshControlPanel()
-    if type(state.panelRefreshFn) == "function" then
-        pcall(state.panelRefreshFn)
     end
 end
 
