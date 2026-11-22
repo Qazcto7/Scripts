@@ -112,6 +112,7 @@ local state = {
     runId = runId,
     active = true,
     afkRenderDisabled = false,
+    afkRevision = 0,
     manualAfk = false,
     focusAfk = false,
     afkToggledManually = false,
@@ -123,6 +124,7 @@ local state = {
     panelVisible = false,
     panelRefreshFn = nil,
     presetBtn = nil,
+    afkBtn = nil,
     rejoinBtn = nil,
     hopBtn = nil,
     lowHopBtn = nil,
@@ -145,6 +147,7 @@ function state.cleanup()
     state.teleportBusyUntil = 0
     state.presetBusy = false
     state.presetBtn = nil
+    state.afkBtn = nil
     state.rejoinBtn = nil
     state.hopBtn = nil
     state.lowHopBtn = nil
@@ -1044,18 +1047,41 @@ end
 
 local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
 
+local function applyRenderAfkState(disable3d)
+    if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
+        pcall(RunService.Set3dRenderingEnabled, RunService, not disable3d)
+    end
+    if setFpsCapFn then
+        pcall(setFpsCapFn, disable3d and cfg.AFKFPSCap or restoredCap)
+    end
+end
+
 local function applyAfkMode(reasonText)
     local shouldAfk = state.manualAfk or state.focusAfk
     state.afkRenderDisabled = shouldAfk
-    if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
-        pcall(RunService.Set3dRenderingEnabled, RunService, not shouldAfk)
-    end
-    if setFpsCapFn then
-        pcall(setFpsCapFn, shouldAfk and cfg.AFKFPSCap or restoredCap)
-    end
+    state.afkRevision = (state.afkRevision or 0) + 1
+    local myRev = state.afkRevision
+
     syncAfkAudio(shouldAfk)
     syncAfkDarkOverlay(shouldAfk)
     refreshControlPanel()
+
+    if shouldAfk then
+        -- Wait one rendered frame so Roblox/Wine paints "AFK Mode: ON" and overlay before pausing 3D rendering
+        if hasRealSpawn and spawnTask then
+            spawnTask(function()
+                waitTask()
+                if isActive() and state.afkRevision == myRev and state.afkRenderDisabled then
+                    applyRenderAfkState(true)
+                end
+            end)
+        else
+            applyRenderAfkState(true)
+        end
+    else
+        applyRenderAfkState(false)
+    end
+
     if reasonText then
         notify("Universal Loader", reasonText)
     end
@@ -1383,6 +1409,7 @@ local function createControlPanel()
     end
 
     state.presetBtn = presetBtn
+    state.afkBtn = afkBtn
     state.rejoinBtn = rejoinBtn
     state.hopBtn = hopBtn
     state.lowHopBtn = lowHopBtn
@@ -1444,7 +1471,11 @@ function api.SetAFK(first, second)
 end
 
 function api.ToggleAFK()
-    return api.SetAFK(not state.manualAfk)
+    if state.afkRenderDisabled then
+        state.focusAfk = false
+        return api.SetAFK(false)
+    end
+    return api.SetAFK(true)
 end
 
 function api.SetPreset(first, second)
