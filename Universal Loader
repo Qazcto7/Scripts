@@ -14,7 +14,7 @@ local DEFAULT_SETTINGS = {
     AFKToggleKey = nil, -- e.g. "F8" or Enum.KeyCode.F8
     AFKDarkScreen = true, -- show dark overlay instead of Roblox's white 3D-disabled screen
     AFKOverlayTimer = true, -- show live elapsed timer on dark overlay while AFK mode is active
-    AFKFPSCap = 15, -- FPS cap applied during AFK mode / unfocus pause
+    AFKFPSCap = 5, -- FPS cap applied during AFK mode / unfocus pause
     AutoAFKOnUnfocus = true, -- pause 3D rendering & cap FPS on Alt-Tab / window unfocus, restore on return
     MuteSoundsOnAFK = true, -- mute MasterVolume while AFK mode is active and restore on exit
     MuteAllSounds = false, -- permanently silence game sounds via Optimizer ("Mute Sounds")
@@ -59,7 +59,7 @@ local PRESET_OPTIMIZER_OVERRIDES = {
             ["Optimize 3D UI"] = "Disable",
             ["Physics Throttle"] = "Skip4",
             ["Disable 3D Rendering"] = true,
-            ["FPS Cap"] = 15,
+            ["FPS Cap"] = 5,
         },
     },
 }
@@ -113,6 +113,8 @@ local state = {
     active = true,
     afkRenderDisabled = false,
     afkRevision = 0,
+    timerRevision = 0,
+    afkPaintPending = false,
     manualAfk = false,
     focusAfk = false,
     afkToggledManually = false,
@@ -141,6 +143,9 @@ local state = {
 
 function state.cleanup()
     state.active = false
+    state.afkRevision = (state.afkRevision or 0) + 1
+    state.timerRevision = (state.timerRevision or 0) + 1
+    state.afkPaintPending = false
     state.panelVisible = false
     state.panelRefreshFn = nil
     state.teleportBusy = false
@@ -710,7 +715,7 @@ state.manualAfk = (initialOpt.Other and initialOpt.Other["Disable 3D Rendering"]
 state.afkRenderDisabled = state.manualAfk
 
 local restoredCap = tonumber(initialOpt.Other and initialOpt.Other["FPS Cap"]) or 999
-if (state.manualAfk and (restoredCap == cfg.AFKFPSCap or restoredCap == 15)) or restoredCap <= 0 then
+if (state.manualAfk and (restoredCap == cfg.AFKFPSCap or restoredCap == 5 or restoredCap == 15)) or restoredCap <= 0 then
     restoredCap = 999
 end
 
@@ -721,6 +726,9 @@ local function clockNow()
         elseif type(os.time) == "function" then
             return os.time()
         end
+    end
+    if type(tick) == "function" then
+        return tick()
     end
     return 0
 end
@@ -821,10 +829,24 @@ local function updateOverlayStatusLabel()
     local elapsed = state.afkStartedAt and (clockNow() - state.afkStartedAt) or 0
     pcall(function()
         lbl.Text = formatOverlayText(elapsed)
+        -- Reading AbsoluteSize forces Roblox's 2D UI layout pass to commit text changes immediately
+        local _ = lbl.AbsoluteSize
     end)
 end
 
+local function waitRenderFrame()
+    local rs = RunService and RunService.RenderStepped
+    if rs and type(rs.Wait) == "function" then
+        local ok = pcall(rs.Wait, rs)
+        if ok then
+            return
+        end
+    end
+    waitTask()
+end
+
 local function stopOverlayTimer()
+    state.timerRevision = (state.timerRevision or 0) + 1
     if state.overlayThread then
         local ot = state.overlayThread
         state.overlayThread = nil
@@ -847,38 +869,56 @@ local function startOverlayTimer()
     if not cfg.AFKOverlayTimer or not hasRealSpawn or state.overlayThread then
         return
     end
+    state.timerRevision = (state.timerRevision or 0) + 1
+    local myTimerRev = state.timerRevision
     state.overlayThread = spawnTask(function()
         local stuckTicks = 0
-        while isActive() and state.afkRenderDisabled and state.afkOverlay do
+        while isActive() and state.timerRevision == myTimerRev and state.afkRenderDisabled and state.afkOverlay do
             local beforeTick = clockNow()
             local curElapsed = math.max(0, beforeTick - (state.afkStartedAt or beforeTick))
-            local sleepSec = math.max(0.25, 1.02 - (curElapsed % 1))
+            local nextWholeSec = math.floor(curElapsed) + 1
+            local sleepSec = math.max(0.1, nextWholeSec - curElapsed + 0.02)
             waitTask(sleepSec)
-            if not isActive() or not state.afkRenderDisabled or not state.afkOverlay then
+            if not isActive() or state.timerRevision ~= myTimerRev or not state.afkRenderDisabled or not state.afkOverlay then
                 break
             end
             local afterTick = clockNow()
             if afterTick <= beforeTick then
                 stuckTicks = stuckTicks + 1
-                if stuckTicks >= 3 then
+                if stuckTicks >= 5 then
                     break
                 end
             else
                 stuckTicks = 0
             end
-            updateOverlayStatusLabel()
-            refreshControlPanel()
-            -- Pulse 1 frame with 3D rendering enabled so Wine/DXVK SwapChain presents the updated timer & UI text
-            if RunService and type(RunService.Set3dRenderingEnabled) == "function" and state.afkRenderDisabled then
+
+            -- Wake 3D rendering BEFORE modifying text, then wait across RenderStepped boundaries so
+            -- Step 5 Render + double/triple-buffered DXVK SwapChain::Present actually flips the new frame.
+            if not state.afkPaintPending and RunService and type(RunService.Set3dRenderingEnabled) == "function" and state.afkRenderDisabled then
                 local pulseRev = state.afkRevision
                 pcall(RunService.Set3dRenderingEnabled, RunService, true)
-                waitTask()
-                if isActive() and state.afkRenderDisabled and state.afkOverlay and state.afkRevision == pulseRev then
+                waitRenderFrame()
+                if not isActive() or state.timerRevision ~= myTimerRev or not state.afkRenderDisabled or not state.afkOverlay or state.afkRevision ~= pulseRev then
+                    break
+                end
+                updateOverlayStatusLabel()
+                refreshControlPanel()
+                waitRenderFrame()
+                if not isActive() or state.timerRevision ~= myTimerRev or not state.afkRenderDisabled or not state.afkOverlay or state.afkRevision ~= pulseRev then
+                    break
+                end
+                waitRenderFrame()
+                if isActive() and state.timerRevision == myTimerRev and state.afkRenderDisabled and state.afkOverlay and state.afkRevision == pulseRev then
                     pcall(RunService.Set3dRenderingEnabled, RunService, false)
                 end
+            else
+                updateOverlayStatusLabel()
+                refreshControlPanel()
             end
         end
-        state.overlayThread = nil
+        if state.timerRevision == myTimerRev then
+            state.overlayThread = nil
+        end
     end)
 end
 
@@ -1057,14 +1097,14 @@ local function syncAfkDarkOverlay(enabled)
     end
 end
 
-local setFpsCapFn = type(setfpscap) == "function" and setfpscap or nil
+local setFpsCapFn = pickFirstFunction(setfpscap, env.setfpscap, set_fps_cap, env.set_fps_cap)
 
 local function applyRenderAfkState(disable3d)
-    if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
-        pcall(RunService.Set3dRenderingEnabled, RunService, not disable3d)
-    end
     if setFpsCapFn then
         pcall(setFpsCapFn, disable3d and cfg.AFKFPSCap or restoredCap)
+    end
+    if RunService and type(RunService.Set3dRenderingEnabled) == "function" then
+        pcall(RunService.Set3dRenderingEnabled, RunService, not disable3d)
     end
 end
 
@@ -1079,18 +1119,30 @@ local function applyAfkMode(reasonText)
     refreshControlPanel()
 
     if shouldAfk then
-        -- Wait one rendered frame so Roblox/Wine paints "AFK Mode: ON" and overlay before pausing 3D rendering
+        -- Let 2 full Render passes complete & flush DXVK SwapChain before pausing 3D rendering and capping FPS to 5
         if hasRealSpawn and spawnTask then
+            state.afkPaintPending = true
             spawnTask(function()
-                waitTask()
+                waitRenderFrame()
                 if isActive() and state.afkRevision == myRev and state.afkRenderDisabled then
-                    applyRenderAfkState(true)
+                    updateOverlayStatusLabel()
+                    refreshControlPanel()
+                end
+                waitRenderFrame()
+                waitRenderFrame()
+                if isActive() and state.afkRevision == myRev then
+                    state.afkPaintPending = false
+                    if state.afkRenderDisabled then
+                        applyRenderAfkState(true)
+                    end
                 end
             end)
         else
+            state.afkPaintPending = false
             applyRenderAfkState(true)
         end
     else
+        state.afkPaintPending = false
         applyRenderAfkState(false)
     end
 
@@ -1121,7 +1173,7 @@ local function buildOptimizerSettings(preserveManualToggle)
 
     local isAfkTarget = (presetKey == "afk") or state.afkRenderDisabled or state.manualAfk
     local explicitCap = tonumber(finalOpt.Other["FPS Cap"])
-    if explicitCap and explicitCap > 0 and not (isAfkTarget and (explicitCap == cfg.AFKFPSCap or explicitCap == 15)) then
+    if explicitCap and explicitCap > 0 and not (isAfkTarget and (explicitCap == cfg.AFKFPSCap or explicitCap == 5 or explicitCap == 15)) then
         restoredCap = explicitCap
     end
 
@@ -1515,18 +1567,19 @@ function api.SetPreset(first, second)
     state.afkToggledManually = true
 
     local finalOpt = buildOptimizerSettings(false)
-    finalOpt.Other["Disable 3D Rendering"] = state.afkRenderDisabled or state.manualAfk
+    -- Let applyAfkMode handle 3D rendering pause & FPS cap after painting overlay/panel across frames
+    finalOpt.Other["Disable 3D Rendering"] = false
     if state.manualAfk then
-        finalOpt.Other["FPS Cap"] = cfg.AFKFPSCap
+        finalOpt.Other["FPS Cap"] = false
     end
-
-    applyAfkMode("Preset: " .. cfg.Preset)
 
     if cfg.LoadOptimizer then
         writeConfigSlot("Settings", finalOpt)
         runUrlOrCode(cfg.BaseUrl .. "Optimizer", "Optimizer", true)
         env.__UniversalLoaderOwnedOpt = env.Settings or (_G and _G.Settings)
     end
+
+    applyAfkMode("Preset: " .. cfg.Preset)
 
     refreshControlPanel()
     return cfg.Preset
@@ -1846,12 +1899,13 @@ local panelToggleKey = resolveKeyCode(cfg.PanelToggleKey)
 
 -- Arm teleport replay, initial AFK overlay/audio, optional panel, hotkeys & Alt-Tab focus listener
 local queueArmed = armTeleportQueueOnce()
-if state.manualAfk then
-    syncAfkAudio(true)
-end
-syncAfkDarkOverlay(state.afkRenderDisabled)
 if cfg.ShowPanel then
     api.SetPanelVisible(true)
+end
+if state.manualAfk then
+    applyAfkMode()
+else
+    syncAfkDarkOverlay(false)
 end
 
 if UserInputService then
