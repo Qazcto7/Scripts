@@ -59,7 +59,7 @@ local PRESET_OPTIMIZER_OVERRIDES = {
             ["Optimize 3D UI"] = "Disable",
             ["Physics Throttle"] = "Skip4",
             ["Disable 3D Rendering"] = true,
-            ["FPS Cap"] = 5,
+            ["FPS Cap"] = DEFAULT_SETTINGS.AFKFPSCap,
         },
     },
 }
@@ -714,10 +714,26 @@ state.manualAfk = (initialOpt.Other and initialOpt.Other["Disable 3D Rendering"]
     or false
 state.afkRenderDisabled = state.manualAfk
 
-local restoredCap = tonumber(initialOpt.Other and initialOpt.Other["FPS Cap"]) or 999
-if (state.manualAfk and (restoredCap == cfg.AFKFPSCap or restoredCap == 5 or restoredCap == 15)) or restoredCap <= 0 then
-    restoredCap = 999
+local function readExplicitFpsCapFromTable(tbl)
+    if type(tbl) ~= "table" then
+        return nil
+    end
+    local cap = tonumber(tbl.Other and tbl.Other["FPS Cap"])
+    if not cap then
+        cap = tonumber(tbl["FPS Cap"])
+    end
+    if cap and cap > 0 then
+        return cap
+    end
+    return nil
 end
+
+local function readExplicitUserFpsCap(userOpt)
+    return readExplicitFpsCapFromTable(userOpt)
+        or readExplicitFpsCapFromTable(cfg.OptimizerSettings)
+end
+
+local restoredCap = readExplicitUserFpsCap(initialUserOpt) or 999
 
 local function clockNow()
     if type(os) == "table" then
@@ -1171,10 +1187,9 @@ local function buildOptimizerSettings(preserveManualToggle)
         finalOpt.Other["Mute Sounds"] = true
     end
 
-    local isAfkTarget = (presetKey == "afk") or state.afkRenderDisabled or state.manualAfk
-    local explicitCap = tonumber(finalOpt.Other["FPS Cap"])
-    if explicitCap and explicitCap > 0 and not (isAfkTarget and (explicitCap == cfg.AFKFPSCap or explicitCap == 5 or explicitCap == 15)) then
-        restoredCap = explicitCap
+    local userCap = readExplicitUserFpsCap(userOpt)
+    if userCap then
+        restoredCap = userCap
     end
 
     if preserveManualToggle and (state.afkToggledManually or state.focusAfk) then
@@ -1187,6 +1202,9 @@ local function buildOptimizerSettings(preserveManualToggle)
     elseif finalOpt.Other["Disable 3D Rendering"] ~= nil then
         state.manualAfk = finalOpt.Other["Disable 3D Rendering"] == true
         state.afkRenderDisabled = state.manualAfk or state.focusAfk
+        if state.afkRenderDisabled then
+            finalOpt.Other["FPS Cap"] = cfg.AFKFPSCap
+        end
     end
 
     return finalOpt
